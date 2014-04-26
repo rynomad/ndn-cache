@@ -60,14 +60,14 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
         }
         var read = false
         cursor.createReadStream({start: start, end: end, reverse: reverse, limit: 1}).on('data', function(data) {
-          console.log('onData in readstream', data.value)
+          //console.log('onData in readstream', data.value)
           read = true
           if ((interest.exclude == null) || (!interest.exclude.matches(new ndn.Name.Component(data.key)))) {
-            console.log('Suffix is not excluded');
+            //console.log('Suffix is not excluded');
             if (data.key == contentKey) {
-              console.log('got to data');
+              //console.log('got to data');
               if ((interest.minSuffixComponents == null) || (suffixIndex >= interest.minSuffixComponents )) {
-                console.log('more than minimum suffix components');
+                //console.log('more than minimum suffix components');
                 db.sublevels[data.value].get(0, function(err, data){
                   if (interest.publisherPublicKeyDigest != undefined) {
                     var d = new ndn.Data()
@@ -82,11 +82,11 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
                   }
                 })
               } else {
-                console.log('not enough suffix')
+                //console.log('not enough suffix')
                 crawl(q, contentKey)
               }
             } else {
-              console.log('keep crawling')
+              //console.log('keep crawling')
 
               if ((interest.maxSuffixComponents == null) || (suffixIndex < interest.maxSuffixComponents)) {
                 suffixIndex++
@@ -98,7 +98,7 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
             }
 
           } else {
-            console.log('name component is excluded in interest,')
+            //console.log('name component is excluded in interest,')
             crawl(q, data.key)
           }
         }).on('end', function(err,data){
@@ -126,12 +126,10 @@ cache.data = function(data, element, cb) {
       levelName = data.name.getPrefix(-1).append(contentKey),
       level = levelName.toUri(),
       ttl;
-  console.log(data.signedInfo)
   if (data.signedInfo.freshnessSeconds != undefined || 0) {
     ttl = data.signedInfo.freshnessSeconds * 1000
     //      console.log(ttl)
 
-    console.log(level, segmentNumber, 'put in cache', element, element.buffer, element.buffer.buffer)
     db.sublevel(level).put(segmentNumber, element,{"ttl": ttl}, function(err){
       cb(err)
     })
@@ -152,7 +150,8 @@ cache.data = function(data, element, cb) {
 
     }
   } else {
-    console.log('no freshnessInfo, dont cache')
+    //console.log('no freshnessInfo, dont cache')
+
   }
 
 }
