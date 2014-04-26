@@ -60,7 +60,7 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
         }
         var read = false
         cursor.createReadStream({start: start, end: end, reverse: reverse, limit: 1}).on('data', function(data) {
-          console.log('onData in readstream')
+          console.log('onData in readstream', data.value)
           read = true
           if ((interest.exclude == null) || (!interest.exclude.matches(new ndn.Name.Component(data.key)))) {
             console.log('Suffix is not excluded');
@@ -131,8 +131,8 @@ cache.data = function(data, element, cb) {
     ttl = data.signedInfo.freshnessSeconds * 1000
     //      console.log(ttl)
 
-    console.log(level, segmentNumber, 'put in cache')
-    db.sublevel(level).put(segmentNumber, element.buffer,{"ttl": ttl}, function(err){
+    console.log(level, segmentNumber, 'put in cache', element, element.buffer, element.buffer.buffer)
+    db.sublevel(level).put(segmentNumber, element,{"ttl": ttl}, function(err){
       cb(err)
     })
     var comps = level.split('/')
