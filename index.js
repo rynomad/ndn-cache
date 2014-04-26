@@ -5,7 +5,7 @@ var level = require('levelup');
 var memdown = require('memdown')
 var sublevel = require('level-sublevel');
 var ttl = require('level-ttl');
-var db = sublevel(ttl(level('cache',{db: memdown}), {checkFrequency: 500}));
+var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
 
 
 
@@ -126,30 +126,31 @@ cache.data = function(data, element, cb) {
       levelName = data.name.getPrefix(-1).append(contentKey),
       level = levelName.toUri(),
       ttl;
+  console.log(data.signedInfo)
   if (data.signedInfo.freshnessSeconds != undefined || 0) {
-      ttl = data.signedInfo.freshnessSeconds * 1000
-//      console.log(ttl)
+    ttl = data.signedInfo.freshnessSeconds * 1000
+    //      console.log(ttl)
 
-  console.log(level, segmentNumber, 'put in cache')
-  db.sublevel(level).put(segmentNumber, element.buffer,{"ttl": ttl}, function(err){
-    cb(err)
-  })
-  var comps = level.split('/')
-  //construct tree
-  for (var i = comps.length - 1; i > 0; i-- ) {
-    //console.log(comps)
-    var value = comps.join('/')
-    var keyComp = comps.pop()
-    if (keyComp == '%00') {
-      var key = contentKey
-    } else {
-      var key = new ndn.Name.Component(keyComp).value
+    console.log(level, segmentNumber, 'put in cache')
+    db.sublevel(level).put(segmentNumber, element.buffer,{"ttl": ttl}, function(err){
+      cb(err)
+    })
+    var comps = level.split('/')
+    //construct tree
+    for (var i = comps.length - 1; i > 0; i-- ) {
+      //console.log(comps)
+      var value = comps.join('/')
+      var keyComp = comps.pop()
+      if (keyComp == '%00') {
+        var key = contentKey
+        } else {
+          var key = new ndn.Name.Component(keyComp).value
+          }
+
+      var slevel = comps.join('/') || '/'
+      db.sublevel(slevel).put(key, value)
+
     }
-
-    var slevel = comps.join('/') || '/'
-    db.sublevel(slevel).put(key, value)
-
-  }
   } else {
     console.log('no freshnessInfo, dont cache')
   }
