@@ -42,12 +42,11 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
     }
   } else {
     // A general interest. Interpret according to selectors and return the first segment of the best matching dataset
-    console.log('crawling', db)
+    console.log('crawling')
     var suffixIndex = 0;
     var hit = false
     function crawl(q, lastfail) {
       var cursor, start, end;
-      console.log(q)
       if (db.sublevels[q] != undefined) {
         cursor = db.sublevels[q]
         if (lastfail && (reverse == true)) {
@@ -113,7 +112,6 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
 
         })
       } else {
-        console.log('no sublevel for', q, db.sublevels)
         onmiss(element,interest)
       }
     }
@@ -130,7 +128,7 @@ cache.data = function(data, element, cb) {
       ttl;
   if (data.signedInfo.freshnessSeconds != undefined || 0) {
       ttl = data.signedInfo.freshnessSeconds * 1000
-      console.log(ttl)
+//      console.log(ttl)
 
   console.log(level, segmentNumber, 'put in cache')
   db.sublevel(level).put(segmentNumber, element.buffer,{"ttl": ttl}, function(err){
@@ -139,7 +137,7 @@ cache.data = function(data, element, cb) {
   var comps = level.split('/')
   //construct tree
   for (var i = comps.length - 1; i > 0; i-- ) {
-    console.log(comps)
+    //console.log(comps)
     var value = comps.join('/')
     var keyComp = comps.pop()
     if (keyComp == '%00') {
@@ -150,7 +148,7 @@ cache.data = function(data, element, cb) {
 
     var slevel = comps.join('/') || '/'
     db.sublevel(slevel).put(key, value)
-    
+
   }
   } else {
     console.log('no freshnessInfo, dont cache')

@@ -12,5 +12,11 @@
     "grunt-saucelabs": "*",
     "grunt-contrib-connect": "~0.7.1",
     "grunt-browserify": "*"
+  },
+  "dependencies": {
+    "levelup": "^0.18.2",
+    "memdown": "^0.7.1",
+    "level-sublevel": "^5.2.0",
+    "level-ttl": "^0.5.0"
   }
 }
