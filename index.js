@@ -5,10 +5,9 @@ var level = require('levelup');
 var memdown = require('memdown')
 var sublevel = require('level-sublevel');
 var ttl = require('level-ttl');
-//var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
+var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
 
 
-var db = {}
 var cache = {}
 cache.db = db
 

@@ -1,6 +1,6 @@
 {
   "name": "ndn-cache",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "ndn caching module for node and the browser",
   "main": "index.js",
   "scripts": {
