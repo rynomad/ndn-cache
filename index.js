@@ -5,10 +5,10 @@ var level = require('levelup');
 var memdown = require('memdown')
 var sublevel = require('level-sublevel');
 var ttl = require('level-ttl');
-var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
+//var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
 
 
-
+var db = {}
 var cache = {}
 cache.db = db
 
@@ -21,13 +21,14 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
       } else {
         reverse = true;
       };
-
+  console.log("params set up in cache check")
   if (utils.endsWithSegmentNumber(interest.name)) {
     // A specific segment of a data object is being requested, so don't bother querying for loose matches, just return or drop
     var level = interest.name.getPrefix(-1).append(contentKey).toUri(),
         segmentNumber = utils.getSegmentInteger(interest.name);
-
+    console.log("ends with seg number")
     if (db.sublevels[level] != undefined) {
+      console.log("about to get")
       db.sublevels[level].get(segmentNumber, function(err, data) {
 
         if (err == undefined) {
@@ -38,6 +39,7 @@ cache.check = function(interest,element, transport, onhit, onmiss) {
         }
       })
     } else {
+      console.log('missing')
       onmiss(element,interest)
     }
   } else {
