@@ -13,8 +13,8 @@ data.signedInfo.setFreshnessPeriod(1000)
 data.signedInfo.setFields()
 data.sign()
 
-var encodedData = data.wireEncode()
-  , element = interest.wireEncode()
+var encodedData = data.wireEncode().buffer
+  , element = interest.wireEncode().buffer
 
 var newTimeout = function(func, sec) {
   return new setTimeout(func, sec)
@@ -30,7 +30,7 @@ describe('cache',function(){
     }, function(){
       done()
     })
-    
+
   })
   it('should accept data', function(done){
   function cb(err){
@@ -40,22 +40,19 @@ describe('cache',function(){
       console.log(err)
     }
   }
-     cache.data(data, encodedData, cb)   
+     cache.data(data, encodedData, cb)
   })
   it('should trigger cache hit', function(done){
      cache.check(interest, element, null, function(a, b){
-       var d = new ndn.Data()
-       d.wireDecode(a)
-       if (d.name.toUri() == interest.name.toUri()){
        done()
-       }
+
      },function(){
        console.log('fail')
      });
   })
   it('should trigger cache miss after timeout',function(done){
     this.timeout(3000)
-    setTimeout(function(){ 
+    setTimeout(function(){
       cache.check(interest, element, null, function(a, b){
           console.log(a,b)
         }, function(a,b){

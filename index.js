@@ -132,7 +132,9 @@ cache.data = function(data, element, cb) {
     //      console.log(ttl)
 
     db.sublevel(level).put(segmentNumber, element,{"ttl": ttl}, function(err){
-      cb(err)
+      console.log(err)
+      if (err) return cb(err)
+      cb()
     })
     var comps = level.split('/')
     //construct tree

@@ -1,247 +1,11 @@
 (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-var utils = require('ndn-utils')
-var ndn = require('ndn-lib');
 
-var level = require('levelup');
-var memdown = require('memdown')
-var sublevel = require('level-sublevel');
-var ttl = require('level-ttl');
-var db = sublevel(ttl(level('cache',{db: memdown}), {checkFrequency: 500}));
-
-
-
-var cache = {}
-cache.db = db
-
-cache.check = function(interest,element, transport, onhit, onmiss) {
-  var uri = interest.name.toUri(),
-      contentKey = utils.initSegment(0),
-      reverse;
-      if ((interest.childSelector == 0) || (interest.childSelector == undefined)) {
-        reverse = false;
-      } else {
-        reverse = true;
-      };
-
-  if (utils.endsWithSegmentNumber(interest.name)) {
-    // A specific segment of a data object is being requested, so don't bother querying for loose matches, just return or drop
-    var level = interest.name.getPrefix(-1).append(contentKey).toUri(),
-        segmentNumber = utils.getSegmentInteger(interest.name);
-
-    if (db.sublevels[level] != undefined) {
-      db.sublevels[level].get(segmentNumber, function(err, data) {
-
-        if (err == undefined) {
-          onhit(data, transport)
-        } else {
-          console.log(err)
-          onmiss(element, interest )
-        }
-      })
-    } else {
-      onmiss(element,interest)
-    }
-  } else {
-    // A general interest. Interpret according to selectors and return the first segment of the best matching dataset
-    console.log('crawling', db)
-    var suffixIndex = 0;
-    var hit = false
-    function crawl(q, lastfail) {
-      var cursor, start, end;
-      console.log(q)
-      if (db.sublevels[q] != undefined) {
-        cursor = db.sublevels[q]
-        if (lastfail && (reverse == true)) {
-          var tmp = lastfail[lastfail.length - 1]
-          lastfail[lastfail.length - 1] = tmp - 1
-          end = lastfail
-        } else if (lastfail) {
-          var tmp = lastfail[lastfail.length - 1]
-          lastfail[lastfail.length - 1] = tmp + 1
-          start = lastfail
-        }
-        var read = false
-        cursor.createReadStream({start: start, end: end, reverse: reverse, limit: 1}).on('data', function(data) {
-          console.log('onData in readstream')
-          read = true
-          if ((interest.exclude == null) || (!interest.exclude.matches(new ndn.Name.Component(data.key)))) {
-            console.log('Suffix is not excluded');
-            if (data.key == contentKey) {
-              console.log('got to data');
-              if ((interest.minSuffixComponents == null) || (suffixIndex >= interest.minSuffixComponents )) {
-                console.log('more than minimum suffix components');
-                db.sublevels[data.value].get(0, function(err, data){
-                  if (interest.publisherPublicKeyDigest != undefined) {
-                    var d = new ndn.Data()
-                    d.decode(data)
-                    if (ndn.DataUtils.arraysEqual(d.signedInfo.publisher.publisherPublicKeyDigest, interest.publisherPublicKeyDigest.publisherPublicKeyDigest)) {
-                      onhit(data, transport)
-                    } else {
-                      crawl(q, contentKey)
-                    }
-                  } else {
-                    onhit(data, transport)
-                  }
-                })
-              } else {
-                console.log('not enough suffix')
-                crawl(q, contentKey)
-              }
-            } else {
-              console.log('keep crawling')
-
-              if ((interest.maxSuffixComponents == null) || (suffixIndex < interest.maxSuffixComponents)) {
-                suffixIndex++
-                crawl(data.value)
-              } else {
-                console.log('reached max suffix');
-                crawl(q, data.key)
-              }
-            }
-
-          } else {
-            console.log('name component is excluded in interest,')
-            crawl(q, data.key)
-          }
-        }).on('end', function(err,data){
-          if ((read == false) && ((interest.minSuffixComponents == null) || (suffixIndex > interest.minSuffixComponents ))) {
-            //we've exhasted this depth, need to go up a level, and we have the leeway from minSuffix to allow
-            var comps = q.split('/')
-            var fail = comps.pop()
-            var newQ = '/' + comps.join('/')
-            crawl(newQ, new ndn.Name.Component(fail).value)
-          }
-
-        })
-      } else {
-        console.log('no sublevel for', q, db.sublevels)
-        onmiss(element,interest)
-      }
-    }
-  crawl(uri)
-  }
-}
-
-
-cache.data = function(data, element, cb) {
-  var segmentNumber = utils.getSegmentInteger(data.name),
-      contentKey = utils.initSegment(0),
-      levelName = data.name.getPrefix(-1).append(contentKey),
-      level = levelName.toUri(),
-      ttl;
-  if (data.signedInfo.freshnessSeconds != undefined || 0) {
-      ttl = data.signedInfo.freshnessSeconds * 1000
-      console.log(ttl)
-
-  console.log(level, segmentNumber, 'put in cache')
-  db.sublevel(level).put(segmentNumber, element.buffer,{"ttl": ttl}, function(err){
-    cb(err)
-  })
-  var comps = level.split('/')
-  //construct tree
-  for (var i = comps.length - 1; i > 0; i-- ) {
-    console.log(comps)
-    var value = comps.join('/')
-    var keyComp = comps.pop()
-    if (keyComp == '%00') {
-      var key = contentKey
-    } else {
-      var key = new ndn.Name.Component(keyComp).value
-    }
-
-    var slevel = comps.join('/') || '/'
-    db.sublevel(slevel).put(key, value)
-    
-  }
-  } else {
-    console.log('no freshnessInfo, dont cache')
-  }
-
-}
-
-
-module.exports = cache;
-
-},{"level-sublevel":29,"level-ttl":41,"levelup":51,"memdown":106,"ndn-lib":138,"ndn-utils":27}],2:[function(require,module,exports){
-window.cache = require('../../index.js')
-window.ndn = require('ndn-lib')
-var utils = require('ndn-utils')
-
-
-var na = new ndn.Name("something").append(utils.initSegment(0))
-  , interest = new ndn.Interest(na)
-  , content = "hello world"
-  , si = new ndn.SignedInfo()
-  , data = new ndn.Data(na, si, content)
-si.setFreshnessPeriod(1000)
-data.signedInfo.setFreshnessPeriod(1000)
-data.signedInfo.setFields()
-data.sign()
-
-var encodedData = data.wireEncode()
-  , element = interest.wireEncode()
-
-var newTimeout = function(func, sec) {
-  return new setTimeout(func, sec)
-}
-
-var initialCheck = false
-var dataInserted = false
-var cacheHit = false
-describe('cache',function(){
-  it('should trigger cache miss callback', function(done){
-    cache.check(interest,element, null, function(){
-      console.log(fail)
-    }, function(){
-      done()
-    })
-    
-  })
-  it('should accept data', function(done){
-  function cb(err){
-    if (!err) {
-      done()
-    } else {
-      console.log(err)
-    }
-  }
-     cache.data(data, encodedData, cb)   
-  })
-  it('should trigger cache hit', function(done){
-     cache.check(interest, element, null, function(a, b){
-       var d = new ndn.Data()
-       d.wireDecode(a)
-       if (d.name.toUri() == interest.name.toUri()){
-       done()
-       }
-     },function(){
-       console.log('fail')
-     });
-  })
-  it('should trigger cache miss after timeout',function(done){
-    this.timeout(3000)
-    setTimeout(function(){ 
-      cache.check(interest, element, null, function(a, b){
-          console.log(a,b)
-        }, function(a,b){
-          done()
-        })
-    }, 1500)
-  })
-})
-
-},{"../../index.js":1,"ndn-lib":138,"ndn-utils":27}],3:[function(require,module,exports){
-
-},{}],4:[function(require,module,exports){
-module.exports=require(3)
-},{}],5:[function(require,module,exports){
-/**
+},{}],2:[function(require,module,exports){
+/*!
  * The buffer module from node.js, for the browser.
  *
- * Author:   Feross Aboukhadijeh <feross@feross.org> <http://feross.org>
- * License:  MIT
- *
- * `npm install buffer`
+ * @author   Feross Aboukhadijeh <feross@feross.org> <http://feross.org>
+ * @license  MIT
  */
 
 var base64 = require('base64-js')
@@ -1347,7 +1111,7 @@ function assert (test, message) {
   if (!test) throw new Error(message || 'Failed assertion')
 }
 
-},{"base64-js":6,"ieee754":7}],6:[function(require,module,exports){
+},{"base64-js":3,"ieee754":4}],3:[function(require,module,exports){
 var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 ;(function (exports) {
@@ -1470,7 +1234,7 @@ var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 	module.exports.fromByteArray = uint8ToBase64
 }())
 
-},{}],7:[function(require,module,exports){
+},{}],4:[function(require,module,exports){
 exports.read = function(buffer, offset, isLE, mLen, nBytes) {
   var e, m,
       eLen = nBytes * 8 - mLen - 1,
@@ -1556,7 +1320,7 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128;
 };
 
-},{}],8:[function(require,module,exports){
+},{}],5:[function(require,module,exports){
 var Buffer = require('buffer').Buffer;
 var intSize = 4;
 var zeroBuffer = new Buffer(intSize); zeroBuffer.fill(0);
@@ -1593,7 +1357,7 @@ function hash(buf, fn, hashSize, bigEndian) {
 
 module.exports = { hash: hash };
 
-},{"buffer":5}],9:[function(require,module,exports){
+},{"buffer":2}],6:[function(require,module,exports){
 var Buffer = require('buffer').Buffer
 var sha = require('./sha')
 var sha256 = require('./sha256')
@@ -1692,7 +1456,7 @@ each(['createCredentials'
   }
 })
 
-},{"./md5":10,"./rng":11,"./sha":12,"./sha256":13,"buffer":5}],10:[function(require,module,exports){
+},{"./md5":7,"./rng":8,"./sha":9,"./sha256":10,"buffer":2}],7:[function(require,module,exports){
 /*
  * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
  * Digest Algorithm, as defined in RFC 1321.
@@ -1857,7 +1621,7 @@ module.exports = function md5(buf) {
   return helpers.hash(buf, core_md5, 16);
 };
 
-},{"./helpers":8}],11:[function(require,module,exports){
+},{"./helpers":5}],8:[function(require,module,exports){
 // Original code adapted from Robert Kieffer.
 // details at https://github.com/broofa/node-uuid
 (function() {
@@ -1890,7 +1654,7 @@ module.exports = function md5(buf) {
 
 }())
 
-},{}],12:[function(require,module,exports){
+},{}],9:[function(require,module,exports){
 /*
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
  * in FIPS PUB 180-1
@@ -1993,7 +1757,7 @@ module.exports = function sha1(buf) {
   return helpers.hash(buf, core_sha1, 20, true);
 };
 
-},{"./helpers":8}],13:[function(require,module,exports){
+},{"./helpers":5}],10:[function(require,module,exports){
 
 /**
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
@@ -2074,7 +1838,7 @@ module.exports = function sha256(buf) {
   return helpers.hash(buf, core_sha256, 32, true);
 };
 
-},{"./helpers":8}],14:[function(require,module,exports){
+},{"./helpers":5}],11:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2376,7 +2140,7 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],15:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -2401,7 +2165,7 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],16:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -2446,13 +2210,6 @@ process.browser = true;
 process.env = {};
 process.argv = [];
 
-function noop() {}
-
-process.on = noop;
-process.once = noop;
-process.off = noop;
-process.emit = noop;
-
 process.binding = function (name) {
     throw new Error('process.binding is not supported');
 }
@@ -2463,7 +2220,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],17:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2537,7 +2294,7 @@ function onend() {
   });
 }
 
-},{"./readable.js":21,"./writable.js":23,"inherits":15,"process/browser.js":19}],18:[function(require,module,exports){
+},{"./readable.js":18,"./writable.js":20,"inherits":12,"process/browser.js":16}],15:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2666,62 +2423,9 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"./duplex.js":17,"./passthrough.js":20,"./readable.js":21,"./transform.js":22,"./writable.js":23,"events":14,"inherits":15}],19:[function(require,module,exports){
-// shim for using process in browser
-
-var process = module.exports = {};
-
-process.nextTick = (function () {
-    var canSetImmediate = typeof window !== 'undefined'
-    && window.setImmediate;
-    var canPost = typeof window !== 'undefined'
-    && window.postMessage && window.addEventListener
-    ;
-
-    if (canSetImmediate) {
-        return function (f) { return window.setImmediate(f) };
-    }
-
-    if (canPost) {
-        var queue = [];
-        window.addEventListener('message', function (ev) {
-            var source = ev.source;
-            if ((source === window || source === null) && ev.data === 'process-tick') {
-                ev.stopPropagation();
-                if (queue.length > 0) {
-                    var fn = queue.shift();
-                    fn();
-                }
-            }
-        }, true);
-
-        return function nextTick(fn) {
-            queue.push(fn);
-            window.postMessage('process-tick', '*');
-        };
-    }
-
-    return function nextTick(fn) {
-        setTimeout(fn, 0);
-    };
-})();
-
-process.title = 'browser';
-process.browser = true;
-process.env = {};
-process.argv = [];
-
-process.binding = function (name) {
-    throw new Error('process.binding is not supported');
-}
-
-// TODO(shtylman)
-process.cwd = function () { return '/' };
-process.chdir = function (dir) {
-    throw new Error('process.chdir is not supported');
-};
-
-},{}],20:[function(require,module,exports){
+},{"./duplex.js":14,"./passthrough.js":17,"./readable.js":18,"./transform.js":19,"./writable.js":20,"events":11,"inherits":12}],16:[function(require,module,exports){
+module.exports=require(13)
+},{}],17:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -2764,7 +2468,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./transform.js":22,"inherits":15}],21:[function(require,module,exports){
+},{"./transform.js":19,"inherits":12}],18:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -3700,8 +3404,8 @@ function indexOf (xs, x) {
   return -1;
 }
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./index.js":18,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"buffer":5,"events":14,"inherits":15,"process/browser.js":19,"string_decoder":24}],22:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./index.js":15,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"events":11,"inherits":12,"process/browser.js":16,"string_decoder":21}],19:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -3907,7 +3611,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./duplex.js":17,"inherits":15}],23:[function(require,module,exports){
+},{"./duplex.js":14,"inherits":12}],20:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4295,7 +3999,7 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-},{"./index.js":18,"buffer":5,"inherits":15,"process/browser.js":19}],24:[function(require,module,exports){
+},{"./index.js":15,"buffer":2,"inherits":12,"process/browser.js":16}],21:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4488,14 +4192,14 @@ function base64DetectIncompleteChar(buffer) {
   return incomplete;
 }
 
-},{"buffer":5}],25:[function(require,module,exports){
+},{"buffer":2}],22:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],26:[function(require,module,exports){
+},{}],23:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -5084,238 +4788,238 @@ function hasOwnProperty(obj, prop) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
 }
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":25,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"inherits":15}],27:[function(require,module,exports){
-var utils = {}
-  , ndn = require('ndn-lib')
-var Data = ndn.Data
-var Name = ndn.Name
-var SignedInfo = ndn.SignedInfo
-var ndnbuf = ndn.customBuffer
-var DataUtils = ndn.DataUtils
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./support/isBuffer":22,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"inherits":12}],24:[function(require,module,exports){
+var utils = require('ndn-utils')
+var ndn = require('ndn-lib');
 
-utils.chunkArbitraryData = function(opts) {
-  var ndnArray = [];
-  //console.log(name)
-  if (opts.type == 'object') {
-    var string = JSON.stringify(opts.thing);
-  } else if (typeof opts.data == 'string') {
-    var string = data;
-  } else if (typeof opts.data == 'file') {
-    //console.log('no handlers yet for datatype: ', typeof data);
-    return;
-  };
-  var name = new ndn.Name(opts.uri)
-  if (opts.version != false) {
-    utils.appendVersion(name, opts.version)
-  }
-  var stringArray = string.match(/.{1,4000}/g);
-  var segmentNames = [];
-  for (i = 0; i < stringArray.length; i++) {
-    segmentNames[i] = new Name(name).appendSegment(i)
-    var co = new Data(segmentNames[i], new SignedInfo(), new ndnbuf(stringArray[i]));
-    co.signedInfo.setFields()
-    co.signedInfo.finalBlockID = utils.initSegment(stringArray.length - 1)
-    console.log(co.signedInfo.finalBlockID)
-    if (opts.freshness != undefined) {
-      co.signedInfo.freshnessSeconds = fresh
-    }
-    co.sign()
-    ndnArray[i] = co.wireEncode()
-  };
-
-  return {array:ndnArray, name: name};
-
-};
-
-utils.initSegment = function(seg) {
-    if (seg == null || seg == 0)
-	  return (new ndnbuf('00', 'hex'));
-
-    var segStr = seg.toString(16);
-
-    if (segStr.length % 2 == 1)
-	segStr = '0' + segStr;
-
-    segStr = '00' + segStr;
-    return (new ndnbuf(segStr, 'hex'));
-};
-
-utils.getAllPrefixes = function(name) {
-  var uriArray = [];
-  for (i = 0 ; i < name.components.length + 1 ; i++) {
-    var uri = name.getPrefix(i).toUri()
-    uriArray.push(uri);
-  };
-  return uriArray;
-};
-
-utils.isFirstSegment = function(name) {
-    return name.components != null && name.components.length >= 1 &&
-        name.components[name.components.length - 1].value.length == 1 &&
-        name.components[name.components.length - 1].value[0] == 0;
-};
-
-utils.isLastSegment = function(name, co) {
-
-    return DataUtils.arraysEqual(name.components[name.components.length - 1].value, co.signedInfo.finalBlockID);
-}
-
-utils.normalizeUri = function(name) {
-  //console.log(name)
-  if (!endsWithSegmentNumber(name)) {
-    normalizedName = name;
-    requestedSegment = 0
-  } else if (!isFirstSegment(name)) {
-    normalizedName = name.getPrefix(name.components.length - 1);
-    requestedSegment = DataUtils.bigEndianToUnsignedInt(name.components[name.components.length - 1].value);
-  } else {
-    normalizedName = name.getPrefix(name.components.length - 1) ;
-    requestedSegment = 0;
-  };
-  var returns = [normalizedName, requestedSegment];
-  return returns;
-};
-
-utils.getSegmentInteger = function(name) {
-  if (name.components != null && name.components.length >= 1 &&
-  name.components[name.components.length - 1].value.length >= 1 &&
-  name.components[name.components.length - 1].value[0] == 0) {
-    return DataUtils.bigEndianToUnsignedInt(name.components[name.components.length - 1].value)
-  } else {
-    return 0;
-  }
-};
-
-utils.normalizeNameToObjectStore = function(name) {
-  var throwaway = utils.getNameWithoutCommandMarker(name);
-
-  if (!utils.endsWithSegmentNumber(throwaway)) {
-    return throwaway.appendSegment(0).toUri();
-  } else if (!utils.isFirstSegment(throwaway)) {
-    return throwaway.getPrefix(name.components.length - 1).appendSegment(0).toUri();
-  } else {
-    return throwaway.toUri();
-  };
-};
-
-utils.endsWithSegmentNumber = function(name) {
-    return name.components != null && name.components.length >= 1 &&
-        name.components[name.components.length - 1].value.length >= 1 &&
-        name.components[name.components.length - 1].value[0] == 0;
-}
-
-utils.nameHasCommandMarker = function(name) {
-  for (var i = name.size() - 1; i >= 0; --i) {
-    var component = name.components[i].getValue();
-    if (component.length <= 0)
-      continue;
-
-    if (component[0] == 0xC1) {
-      return true
-    };
-  }
-
-  return false;
-};
-
-utils.getCommandMarker = function(name) {
-  //console.log(name)
-  for (var i = name.size() - 1; i >= 0; --i) {
-    var component = name.components[i].getValue();
-    if (component.length <= 0)
-      continue;
-
-    if (component[0] == 0xC1 && component[2] != 0x4E) {
-      return name.components[i].toEscapedString()
-    };
-  }
-};
-
-utils.getNameWithoutCommandMarker = function(name) {
-  var strippedName = new Name('');
-
-  for (var i = 0 ; i < name.size(); i++) {
-    var component = name.components[i].getValue();
-    if (component.length <= 0)
-      continue;
-
-    if (component[0] != 0xC1) {
-      strippedName.append(name.components[i]);
-    };
-  };
-  return strippedName;
-};
+var level = require('levelup');
+var memdown = require('memdown')
+var sublevel = require('level-sublevel');
+var ttl = require('level-ttl');
+var db = sublevel(ttl(level('cache',{db: memdown, valueEncoding: 'binary'}), {checkFrequency: 500}));
 
 
-utils.getSuffix = function(name, p) {
-    return new Name(name.components.slice(p));
-};
+var cache = {}
+cache.db = db
 
-utils.appendVersion = function(name, date) {
-    console.log(date)
-    if (date) {
-      if (date instanceof Date) {
-        var d = date.getTime()
+cache.check = function(interest,element, transport, onhit, onmiss) {
+  var uri = interest.name.toUri(),
+      contentKey = utils.initSegment(0),
+      reverse;
+      if ((interest.childSelector == 0) || (interest.childSelector == undefined)) {
+        reverse = false;
+      } else {
+        reverse = true;
+      };
+  console.log("params set up in cache check")
+  if (utils.endsWithSegmentNumber(interest.name)) {
+    // A specific segment of a data object is being requested, so don't bother querying for loose matches, just return or drop
+    var level = interest.name.getPrefix(-1).append(contentKey).toUri(),
+        segmentNumber = utils.getSegmentInteger(interest.name);
+    console.log("ends with seg number")
+    if (db.sublevels[level] != undefined) {
+      console.log("about to get")
+      db.sublevels[level].get(segmentNumber, function(err, data) {
 
-      } else if (typeof date == "number")
-        var d = new Date().setTime(date)
+        if (err == undefined) {
+          onhit(data, transport)
+        } else {
+          console.log(err)
+          onmiss(element, interest )
+        }
+      })
     } else {
-      var d = new Date().getTime();
-    };
-
-    var time = d.toString(16);
-    if (time.length % 2 == 1) {
-	    time = '0' + time;
-    };
-    time = 'fd' + time;
-    var binTime = new ndnbuf(time, 'hex');
-    //console.log(binTime)
-    return name.append(binTime);
-};
-
-utils.timeToVersion = function(date) {
-  if (date instanceof Date) {
-    var d = date.getTime
+      console.log('missing')
+      onmiss(element,interest)
+    }
   } else {
-    var d = date;
-  };
-  var time = d.toString(16);
-  if (time.length % 2 == 1) {
-    time = '0' + time;
-  };
-  time = 'fd' + time;
-  var binTime = new ndnbuf(time, 'hex');
-  return (new Name.Component(binTime).toEscapedString())
+    // A general interest. Interpret according to selectors and return the first segment of the best matching dataset
+    console.log('crawling')
+    var suffixIndex = 0;
+    var hit = false
+    function crawl(q, lastfail) {
+      var cursor, start, end;
+      if (db.sublevels[q] != undefined) {
+        cursor = db.sublevels[q]
+        if (lastfail && (reverse == true)) {
+          var tmp = lastfail[lastfail.length - 1]
+          lastfail[lastfail.length - 1] = tmp - 1
+          end = lastfail
+        } else if (lastfail) {
+          var tmp = lastfail[lastfail.length - 1]
+          lastfail[lastfail.length - 1] = tmp + 1
+          start = lastfail
+        }
+        var read = false
+        cursor.createReadStream({start: start, end: end, reverse: reverse, limit: 1}).on('data', function(data) {
+          //console.log('onData in readstream', data.value)
+          read = true
+          if ((interest.exclude == null) || (!interest.exclude.matches(new ndn.Name.Component(data.key)))) {
+            //console.log('Suffix is not excluded');
+            if (data.key == contentKey) {
+              //console.log('got to data');
+              if ((interest.minSuffixComponents == null) || (suffixIndex >= interest.minSuffixComponents )) {
+                //console.log('more than minimum suffix components');
+                db.sublevels[data.value].get(0, function(err, data){
+                  if (interest.publisherPublicKeyDigest != undefined) {
+                    var d = new ndn.Data()
+                    d.decode(data)
+                    if (ndn.DataUtils.arraysEqual(d.signedInfo.publisher.publisherPublicKeyDigest, interest.publisherPublicKeyDigest.publisherPublicKeyDigest)) {
+                      onhit(data, transport)
+                    } else {
+                      crawl(q, contentKey)
+                    }
+                  } else {
+                    onhit(data, transport)
+                  }
+                })
+              } else {
+                //console.log('not enough suffix')
+                crawl(q, contentKey)
+              }
+            } else {
+              //console.log('keep crawling')
 
-};
+              if ((interest.maxSuffixComponents == null) || (suffixIndex < interest.maxSuffixComponents)) {
+                suffixIndex++
+                crawl(data.value)
+              } else {
+                console.log('reached max suffix');
+                crawl(q, data.key)
+              }
+            }
 
-utils.versionToTime = function(version) {
-  time = 0
-  array = DataUtils.toNumbers(DataUtils.toHex(version))
-  //console.log(array)
-  for (i = 1; i < array.length ; i++) {
-    time = time + (array[i] * Math.pow(2, (7 - i)));
-    //console.log(time)
-  };
-  return time
-};
+          } else {
+            //console.log('name component is excluded in interest,')
+            crawl(q, data.key)
+          }
+        }).on('end', function(err,data){
+          if ((read == false) && ((interest.minSuffixComponents == null) || (suffixIndex > interest.minSuffixComponents ))) {
+            //we've exhasted this depth, need to go up a level, and we have the leeway from minSuffix to allow
+            var comps = q.split('/')
+            var fail = comps.pop()
+            var newQ = '/' + comps.join('/')
+            crawl(newQ, new ndn.Name.Component(fail).value)
+          }
 
-
-
-utils.setNonce = function(interest) {
-  var bytes = [0xc1, 0x2e, 0x4e, 0x00];
-  for (var n = 8; n > 0; n--) {
-	  bytes.push(Math.floor(Math.random() * 256));
-	  //console.log(bytes)
+        })
+      } else {
+        onmiss(element,interest)
+      }
+    }
+  crawl(uri)
   }
-  var buf = new ndnbuf(bytes);
-  interest.nonce = buf;
 }
 
-module.exports = utils;
 
-},{"ndn-lib":138}],28:[function(require,module,exports){
+cache.data = function(data, element, cb) {
+  var segmentNumber = utils.getSegmentInteger(data.name),
+      contentKey = utils.initSegment(0),
+      levelName = data.name.getPrefix(-1).append(contentKey),
+      level = levelName.toUri(),
+      ttl;
+  if (data.signedInfo.freshnessSeconds != undefined || 0) {
+    ttl = data.signedInfo.freshnessSeconds * 1000
+    //      console.log(ttl)
+
+    db.sublevel(level).put(segmentNumber, element,{"ttl": ttl}, function(err){
+      console.log(err)
+      if (err) return cb(err)
+      cb()
+    })
+    var comps = level.split('/')
+    //construct tree
+    for (var i = comps.length - 1; i > 0; i-- ) {
+      //console.log(comps)
+      var value = comps.join('/')
+      var keyComp = comps.pop()
+      if (keyComp == '%00') {
+        var key = contentKey
+        } else {
+          var key = new ndn.Name.Component(keyComp).value
+          }
+
+      var slevel = comps.join('/') || '/'
+      db.sublevel(slevel).put(key, value)
+
+    }
+  } else {
+    //console.log('no freshnessInfo, dont cache')
+
+  }
+
+}
+
+
+module.exports = cache;
+
+},{"level-sublevel":27,"level-ttl":39,"levelup":49,"memdown":78,"ndn-lib":110,"ndn-utils":205}],25:[function(require,module,exports){
+window.cache = require('../../index.js')
+window.ndn = require('ndn-lib')
+var utils = require('ndn-utils')
+
+
+var na = new ndn.Name("something").append(utils.initSegment(0))
+  , interest = new ndn.Interest(na)
+  , content = "hello world"
+  , si = new ndn.SignedInfo()
+  , data = new ndn.Data(na, si, content)
+si.setFreshnessPeriod(1000)
+data.signedInfo.setFreshnessPeriod(1000)
+data.signedInfo.setFields()
+data.sign()
+
+var encodedData = data.wireEncode().buffer
+  , element = interest.wireEncode().buffer
+
+var newTimeout = function(func, sec) {
+  return new setTimeout(func, sec)
+}
+
+var initialCheck = false
+var dataInserted = false
+var cacheHit = false
+describe('cache',function(){
+  it('should trigger cache miss callback', function(done){
+    cache.check(interest,element, null, function(){
+      console.log(fail)
+    }, function(){
+      done()
+    })
+
+  })
+  it('should accept data', function(done){
+  function cb(err){
+    if (!err) {
+      done()
+    } else {
+      console.log(err)
+    }
+  }
+     cache.data(data, encodedData, cb)
+  })
+  it('should trigger cache hit', function(done){
+     cache.check(interest, element, null, function(a, b){
+       done()
+
+     },function(){
+       console.log('fail')
+     });
+  })
+  it('should trigger cache miss after timeout',function(done){
+    this.timeout(3000)
+    setTimeout(function(){
+      cache.check(interest, element, null, function(a, b){
+          console.log(a,b)
+        }, function(a,b){
+          done()
+        })
+    }, 1500)
+  })
+})
+
+},{"../../index.js":24,"ndn-lib":110,"ndn-utils":205}],26:[function(require,module,exports){
 function addOperation (type, key, value, options) {
   var operation = {
     type: type,
@@ -5355,7 +5059,7 @@ B.write = function (cb) {
 
 module.exports = Batch
 
-},{}],29:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
 (function (process){
 var EventEmitter = require('events').EventEmitter
 var next         = process.nextTick
@@ -5448,8 +5152,8 @@ module.exports   = function (_db, options) {
 }
 
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./batch":28,"./sub":40,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"events":14,"level-fix-range":30,"level-hooks":32}],30:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./batch":26,"./sub":38,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"events":11,"level-fix-range":28,"level-hooks":30}],28:[function(require,module,exports){
 var clone = require('clone')
 
 module.exports = 
@@ -5475,9 +5179,9 @@ function fixRange(opts) {
   return opts
 }
 
-},{"clone":31}],31:[function(require,module,exports){
+},{"clone":29}],29:[function(require,module,exports){
 (function (Buffer){
-"use strict";
+'use strict';
 
 function objectToString(o) {
   return Object.prototype.toString.call(o);
@@ -5502,6 +5206,7 @@ var util = {
   }
 };
 
+
 if (typeof module === 'object')
   module.exports = clone;
 
@@ -5518,107 +5223,70 @@ if (typeof module === 'object')
  * @param `parent` - the object to be cloned
  * @param `circular` - set to true if the object to be cloned may contain
  *    circular references. (optional - true by default)
+ * @param `depth` - set to a number if the object is only to be cloned to
+ *    a particular depth. (optional - defaults to Infinity)
 */
-function clone(parent, circular) {
-  if (typeof circular == 'undefined')
-    circular = true;
+
+function clone(parent, circular, depth) {
+  // maintain two arrays for circular references, where corresponding parents
+  // and children have the same index
+  var allParents = [];
+  var allChildren = [];
 
   var useBuffer = typeof Buffer != 'undefined';
 
-  var circularParent = {};
-  var circularResolved = {};
-  var circularReplace = [];
+  if (typeof circular == 'undefined')
+    circular = true;
 
-  function _clone(parent, context, child, cIndex) {
-    var i; // Use local context within this function
-    // Deep clone all properties of parent into child
-    if (typeof parent == 'object') {
-      if (parent == null)
-        return parent;
-      // Check for circular references
-      for(i in circularParent)
-        if (circularParent[i] === parent) {
-          // We found a circular reference
-          circularReplace.push({'resolveTo': i, 'child': child, 'i': cIndex});
-          return null; //Just return null for now...
-          // we will resolve circular references later
-        }
+  if (typeof depth == 'undefined')
+    depth = Infinity;
 
-      // Add to list of all parent objects
-      circularParent[context] = parent;
-      // Now continue cloning...
-      if (util.isArray(parent)) {
-        child = [];
-        for(i in parent)
-          child[i] = _clone(parent[i], context + '[' + i + ']', child, i);
-      }
-      else if (util.isDate(parent))
-        child = new Date(parent.getTime());
-      else if (util.isRegExp(parent)) {
-        child = new RegExp(parent.source, util.getRegExpFlags(parent));
-        if (parent.lastIndex) child.lastIndex = parent.lastIndex;
-      } else if (useBuffer && Buffer.isBuffer(parent))
-      {
-        child = new Buffer(parent.length);
-        parent.copy(child);
-      }
-      else {
-        child = {};
+  // recurse this function so we don't reset allParents and allChildren
+  function _clone(parent, depth) {
+    // cloning null always returns null
+    if (parent === null)
+      return null;
 
-        // Also copy prototype over to new cloned object
-        child.__proto__ = parent.__proto__;
-        for(i in parent)
-          child[i] = _clone(parent[i], context + '[' + i + ']', child, i);
-      }
+    if (depth == 0)
+      return parent;
 
-      // Add to list of all cloned objects
-      circularResolved[context] = child;
-    }
-    else
-      child = parent; //Just a simple shallow copy will do
-    return child;
-  }
-
-  var i;
-  if (circular) {
-    var cloned = _clone(parent, '*');
-
-    // Now this object has been cloned. Let's check to see if there are any
-    // circular references for it
-    for(i in circularReplace) {
-      var c = circularReplace[i];
-      if (c && c.child && c.i in c.child) {
-        c.child[c.i] = circularResolved[c.resolveTo];
-      }
-    }
-    return cloned;
-  } else {
-    // Deep clone all properties of parent into child
     var child;
-    if (typeof parent == 'object') {
-      if (parent == null)
-        return parent;
-      if (parent.constructor.name === 'Array') {
-        child = [];
-        for(i in parent)
-          child[i] = clone(parent[i], circular);
-      }
-      else if (util.isDate(parent))
-        child = new Date(parent.getTime() );
-      else if (util.isRegExp(parent)) {
-        child = new RegExp(parent.source, util.getRegExpFlags(parent));
-        if (parent.lastIndex) child.lastIndex = parent.lastIndex;
-      } else {
-        child = {};
-        child.__proto__ = parent.__proto__;
-        for(i in parent)
-          child[i] = clone(parent[i], circular);
-      }
+    if (typeof parent != 'object') {
+      return parent;
     }
-    else
-      child = parent; // Just a simple shallow clone will do
+
+    if (util.isArray(parent)) {
+      child = [];
+    } else if (util.isRegExp(parent)) {
+      child = new RegExp(parent.source, util.getRegExpFlags(parent));
+      if (parent.lastIndex) child.lastIndex = parent.lastIndex;
+    } else if (util.isDate(parent)) {
+      child = new Date(parent.getTime());
+    } else if (useBuffer && Buffer.isBuffer(parent)) {
+      child = new Buffer(parent.length);
+      parent.copy(child);
+    } else {
+      child = Object.create(Object.getPrototypeOf(parent));
+    }
+
+    if (circular) {
+      var index = allParents.indexOf(parent);
+
+      if (index != -1) {
+        return allChildren[index];
+      }
+      allParents.push(parent);
+      allChildren.push(child);
+    }
+
+    for (var i in parent) {
+      child[i] = _clone(parent[i], depth - 1);
+    }
+
     return child;
   }
+
+  return _clone(parent, depth);
 }
 
 /**
@@ -5638,7 +5306,7 @@ clone.clonePrototype = function(parent) {
 };
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":5}],32:[function(require,module,exports){
+},{"buffer":2}],30:[function(require,module,exports){
 var ranges = require('string-range')
 
 module.exports = function (db) {
@@ -5804,7 +5472,7 @@ module.exports = function (db) {
   }
 }
 
-},{"string-range":33}],33:[function(require,module,exports){
+},{"string-range":31}],31:[function(require,module,exports){
 
 //force to a valid range
 var range = exports.range = function (obj) {
@@ -5878,7 +5546,7 @@ var satifies = exports.satisfies = function (key, range) {
 
 
 
-},{}],34:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 module.exports = hasKeys
 
 function hasKeys(source) {
@@ -5887,7 +5555,7 @@ function hasKeys(source) {
         typeof source === "function")
 }
 
-},{}],35:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 var Keys = require("object-keys")
 var hasKeys = require("./has-keys")
 
@@ -5914,11 +5582,11 @@ function extend() {
     return target
 }
 
-},{"./has-keys":34,"object-keys":36}],36:[function(require,module,exports){
+},{"./has-keys":32,"object-keys":34}],34:[function(require,module,exports){
 module.exports = Object.keys || require('./shim');
 
 
-},{"./shim":39}],37:[function(require,module,exports){
+},{"./shim":37}],35:[function(require,module,exports){
 
 var hasOwn = Object.prototype.hasOwnProperty;
 var toString = Object.prototype.toString;
@@ -5942,7 +5610,7 @@ module.exports = function forEach (obj, fn, ctx) {
 };
 
 
-},{}],38:[function(require,module,exports){
+},{}],36:[function(require,module,exports){
 
 /**!
  * is
@@ -6646,7 +6314,7 @@ is.string = function (value) {
 };
 
 
-},{}],39:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
 (function () {
 	"use strict";
 
@@ -6692,7 +6360,7 @@ is.string = function (value) {
 }());
 
 
-},{"foreach":37,"is":38}],40:[function(require,module,exports){
+},{"foreach":35,"is":36}],38:[function(require,module,exports){
 var EventEmitter = require('events').EventEmitter
 var inherits     = require('util').inherits
 var ranges       = require('string-range')
@@ -6971,7 +6639,7 @@ SDB.post = function (range, hook) {
 var exports = module.exports = SubDB
 
 
-},{"./batch":28,"events":14,"level-fix-range":30,"string-range":33,"util":26,"xtend":35}],41:[function(require,module,exports){
+},{"./batch":26,"events":11,"level-fix-range":28,"string-range":31,"util":23,"xtend":33}],39:[function(require,module,exports){
 const after    = require('after')
     , xtend    = require('xtend')
     , sublevel = require('level-sublevel')
@@ -7219,7 +6887,7 @@ var startTtl = function (db, checkFrequency) {
 
 module.exports = setup
 
-},{"after":42,"level-sublevel":29,"xtend":44}],42:[function(require,module,exports){
+},{"after":40,"level-sublevel":27,"xtend":42}],40:[function(require,module,exports){
 module.exports = after
 
 function after(count, callback, err_cb) {
@@ -7249,11 +6917,11 @@ function after(count, callback, err_cb) {
 
 function noop() {}
 
-},{}],43:[function(require,module,exports){
-module.exports=require(34)
-},{}],44:[function(require,module,exports){
-arguments[4][35][0].apply(exports,arguments)
-},{"./has-keys":43,"object-keys":46}],45:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
+module.exports=require(32)
+},{}],42:[function(require,module,exports){
+arguments[4][33][0].apply(exports,arguments)
+},{"./has-keys":41,"object-keys":44}],43:[function(require,module,exports){
 var hasOwn = Object.prototype.hasOwnProperty;
 var toString = Object.prototype.toString;
 
@@ -7295,9 +6963,9 @@ module.exports = function forEach(obj, fn) {
 };
 
 
-},{}],46:[function(require,module,exports){
-arguments[4][36][0].apply(exports,arguments)
-},{"./shim":48}],47:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"./shim":46}],45:[function(require,module,exports){
 var toString = Object.prototype.toString;
 
 module.exports = function isArguments(value) {
@@ -7315,7 +6983,7 @@ module.exports = function isArguments(value) {
 };
 
 
-},{}],48:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 (function () {
 	"use strict";
 
@@ -7379,7 +7047,7 @@ module.exports = function isArguments(value) {
 }());
 
 
-},{"./foreach":45,"./isArguments":47}],49:[function(require,module,exports){
+},{"./foreach":43,"./isArguments":45}],47:[function(require,module,exports){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
  * MIT +no-false-attribs License
@@ -7459,7 +7127,7 @@ Batch.prototype.write = function (callback) {
 
 module.exports = Batch
 
-},{"./errors":50,"./util":53}],50:[function(require,module,exports){
+},{"./errors":48,"./util":51}],48:[function(require,module,exports){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
  * MIT +no-false-attribs License
@@ -7482,7 +7150,7 @@ module.exports = {
   , NotFoundError       : NotFoundError
   , EncodingError       : createError('EncodingError', LevelUPError)
 }
-},{"errno":87}],51:[function(require,module,exports){
+},{"errno":59}],49:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
@@ -7920,8 +7588,8 @@ module.exports.destroy = utilStatic('destroy')
 // DEPRECATED: prefer accessing LevelDOWN for this: require('leveldown').repair()
 module.exports.repair  = utilStatic('repair')
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./batch":49,"./errors":50,"./read-stream":52,"./util":53,"./write-stream":54,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"deferred-leveldown":69,"events":14,"prr":88,"util":26,"xtend":100}],52:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./batch":47,"./errors":48,"./read-stream":50,"./util":51,"./write-stream":52,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"deferred-leveldown":54,"events":11,"prr":60,"util":23,"xtend":72}],50:[function(require,module,exports){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
  * MIT +no-false-attribs License <https://github.com/rvagg/node-levelup/blob/master/LICENSE>
@@ -8043,7 +7711,8 @@ ReadStream.prototype.toString = function () {
 
 module.exports = ReadStream
 
-},{"./errors":50,"./util":53,"readable-stream":98,"util":26,"xtend":100}],53:[function(require,module,exports){
+},{"./errors":48,"./util":51,"readable-stream":70,"util":23,"xtend":72}],51:[function(require,module,exports){
+(function (process,Buffer){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
  * MIT +no-false-attribs License
@@ -8052,7 +7721,6 @@ module.exports = ReadStream
 
 var extend        = require('xtend')
   , LevelUPError  = require('./errors').LevelUPError
-  , bops          = require('bops')
 
   , encodingNames = [
         'hex'
@@ -8079,7 +7747,7 @@ var extend        = require('xtend')
 
   , encodings = (function () {
       function isBinary (data) {
-        return data === undefined || data === null || bops.is(data)
+        return data === undefined || data === null || Buffer.isBuffer(data)
       }
 
       var encodings = {}
@@ -8087,7 +7755,9 @@ var extend        = require('xtend')
           encode : function (data) {
             return isBinary(data) ? data : String(data)
           }
-        , decode : function (data) { return data }
+        , decode : function (data) {
+          return data
+          }
         , buffer : false
         , type   : 'utf8'
       }
@@ -8102,10 +7772,10 @@ var extend        = require('xtend')
           return
         encodings[type] = {
             encode : function (data) {
-              return isBinary(data) ? data : bops.from(data, type)
+              return isBinary(data) ? data : new Buffer(data, type)
             }
           , decode : function (buffer) {
-              return bops.from(buffer, type)
+              return process.browser ? buffer.toString(type) : buffer;
             }
           , buffer : true
           , type   : type // useful for debugging purposes
@@ -8226,7 +7896,8 @@ module.exports = {
   , decodeKey       : decodeKey
 }
 
-},{"../package.json":105,"./errors":50,"bops":55,"leveldown":4,"leveldown/package":4,"semver":4,"xtend":100}],54:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"../package.json":77,"./errors":48,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"leveldown":1,"leveldown/package":1,"semver":1,"xtend":72}],52:[function(require,module,exports){
 (function (process,global){
 /* Copyright (c) 2012-2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
@@ -8407,673 +8078,8 @@ WriteStream.prototype.toString = function () {
 
 module.exports = WriteStream
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./util":53,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"concat-stream":68,"stream":18,"util":26,"xtend":100}],55:[function(require,module,exports){
-var proto = {}
-module.exports = proto
-
-proto.from = require('./from.js')
-proto.to = require('./to.js')
-proto.is = require('./is.js')
-proto.subarray = require('./subarray.js')
-proto.join = require('./join.js')
-proto.copy = require('./copy.js')
-proto.create = require('./create.js')
-
-mix(require('./read.js'), proto)
-mix(require('./write.js'), proto)
-
-function mix(from, into) {
-  for(var key in from) {
-    into[key] = from[key]
-  }
-}
-
-},{"./copy.js":58,"./create.js":59,"./from.js":60,"./is.js":61,"./join.js":62,"./read.js":64,"./subarray.js":65,"./to.js":66,"./write.js":67}],56:[function(require,module,exports){
-(function (exports) {
-	'use strict';
-
-	var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-	function b64ToByteArray(b64) {
-		var i, j, l, tmp, placeHolders, arr;
-	
-		if (b64.length % 4 > 0) {
-			throw 'Invalid string. Length must be a multiple of 4';
-		}
-
-		// the number of equal signs (place holders)
-		// if there are two placeholders, than the two characters before it
-		// represent one byte
-		// if there is only one, then the three characters before it represent 2 bytes
-		// this is just a cheap hack to not do indexOf twice
-		placeHolders = b64.indexOf('=');
-		placeHolders = placeHolders > 0 ? b64.length - placeHolders : 0;
-
-		// base64 is 4/3 + up to two characters of the original data
-		arr = [];//new Uint8Array(b64.length * 3 / 4 - placeHolders);
-
-		// if there are placeholders, only get up to the last complete 4 chars
-		l = placeHolders > 0 ? b64.length - 4 : b64.length;
-
-		for (i = 0, j = 0; i < l; i += 4, j += 3) {
-			tmp = (lookup.indexOf(b64[i]) << 18) | (lookup.indexOf(b64[i + 1]) << 12) | (lookup.indexOf(b64[i + 2]) << 6) | lookup.indexOf(b64[i + 3]);
-			arr.push((tmp & 0xFF0000) >> 16);
-			arr.push((tmp & 0xFF00) >> 8);
-			arr.push(tmp & 0xFF);
-		}
-
-		if (placeHolders === 2) {
-			tmp = (lookup.indexOf(b64[i]) << 2) | (lookup.indexOf(b64[i + 1]) >> 4);
-			arr.push(tmp & 0xFF);
-		} else if (placeHolders === 1) {
-			tmp = (lookup.indexOf(b64[i]) << 10) | (lookup.indexOf(b64[i + 1]) << 4) | (lookup.indexOf(b64[i + 2]) >> 2);
-			arr.push((tmp >> 8) & 0xFF);
-			arr.push(tmp & 0xFF);
-		}
-
-		return arr;
-	}
-
-	function uint8ToBase64(uint8) {
-		var i,
-			extraBytes = uint8.length % 3, // if we have 1 byte left, pad 2 bytes
-			output = "",
-			temp, length;
-
-		function tripletToBase64 (num) {
-			return lookup[num >> 18 & 0x3F] + lookup[num >> 12 & 0x3F] + lookup[num >> 6 & 0x3F] + lookup[num & 0x3F];
-		};
-
-		// go through the array every three bytes, we'll deal with trailing stuff later
-		for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
-			temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2]);
-			output += tripletToBase64(temp);
-		}
-
-		// pad the end with zeros, but make sure to not forget the extra bytes
-		switch (extraBytes) {
-			case 1:
-				temp = uint8[uint8.length - 1];
-				output += lookup[temp >> 2];
-				output += lookup[(temp << 4) & 0x3F];
-				output += '==';
-				break;
-			case 2:
-				temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1]);
-				output += lookup[temp >> 10];
-				output += lookup[(temp >> 4) & 0x3F];
-				output += lookup[(temp << 2) & 0x3F];
-				output += '=';
-				break;
-		}
-
-		return output;
-	}
-
-	module.exports.toByteArray = b64ToByteArray;
-	module.exports.fromByteArray = uint8ToBase64;
-}());
-
-},{}],57:[function(require,module,exports){
-module.exports = to_utf8
-
-var out = []
-  , col = []
-  , fcc = String.fromCharCode
-  , mask = [0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01]
-  , unmask = [
-      0x00
-    , 0x01
-    , 0x02 | 0x01
-    , 0x04 | 0x02 | 0x01
-    , 0x08 | 0x04 | 0x02 | 0x01
-    , 0x10 | 0x08 | 0x04 | 0x02 | 0x01
-    , 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01
-    , 0x40 | 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01
-  ]
-
-function to_utf8(bytes, start, end) {
-  start = start === undefined ? 0 : start
-  end = end === undefined ? bytes.length : end
-
-  var idx = 0
-    , hi = 0x80
-    , collecting = 0
-    , pos
-    , by
-
-  col.length =
-  out.length = 0
-
-  while(idx < bytes.length) {
-    by = bytes[idx]
-    if(!collecting && by & hi) {
-      pos = find_pad_position(by)
-      collecting += pos
-      if(pos < 8) {
-        col[col.length] = by & unmask[6 - pos]
-      }
-    } else if(collecting) {
-      col[col.length] = by & unmask[6]
-      --collecting
-      if(!collecting && col.length) {
-        out[out.length] = fcc(reduced(col, pos))
-        col.length = 0
-      }
-    } else { 
-      out[out.length] = fcc(by)
-    }
-    ++idx
-  }
-  if(col.length && !collecting) {
-    out[out.length] = fcc(reduced(col, pos))
-    col.length = 0
-  }
-  return out.join('')
-}
-
-function find_pad_position(byt) {
-  for(var i = 0; i < 7; ++i) {
-    if(!(byt & mask[i])) {
-      break
-    }
-  }
-  return i
-}
-
-function reduced(list) {
-  var out = 0
-  for(var i = 0, len = list.length; i < len; ++i) {
-    out |= list[i] << ((len - i - 1) * 6)
-  }
-  return out
-}
-
-},{}],58:[function(require,module,exports){
-module.exports = copy
-
-var slice = [].slice
-
-function copy(source, target, target_start, source_start, source_end) {
-  target_start = arguments.length < 3 ? 0 : target_start
-  source_start = arguments.length < 4 ? 0 : source_start
-  source_end = arguments.length < 5 ? source.length : source_end
-
-  if(source_end === source_start) {
-    return
-  }
-
-  if(target.length === 0 || source.length === 0) {
-    return
-  }
-
-  if(source_end > source.length) {
-    source_end = source.length
-  }
-
-  if(target.length - target_start < source_end - source_start) {
-    source_end = target.length - target_start + source_start
-  }
-
-  if(source.buffer !== target.buffer) {
-    return fast_copy(source, target, target_start, source_start, source_end)
-  }
-  return slow_copy(source, target, target_start, source_start, source_end)
-}
-
-function fast_copy(source, target, target_start, source_start, source_end) {
-  var len = (source_end - source_start) + target_start
-
-  for(var i = target_start, j = source_start;
-      i < len;
-      ++i,
-      ++j) {
-    target[i] = source[j]
-  }
-}
-
-function slow_copy(from, to, j, i, jend) {
-  // the buffers could overlap.
-  var iend = jend + i
-    , tmp = new Uint8Array(slice.call(from, i, iend))
-    , x = 0
-
-  for(; i < iend; ++i, ++x) {
-    to[j++] = tmp[x]
-  }
-}
-
-},{}],59:[function(require,module,exports){
-module.exports = function(size) {
-  return new Uint8Array(size)
-}
-
-},{}],60:[function(require,module,exports){
-module.exports = from
-
-var base64 = require('base64-js')
-
-var decoders = {
-    hex: from_hex
-  , utf8: from_utf
-  , base64: from_base64
-}
-
-function from(source, encoding) {
-  if(Array.isArray(source)) {
-    return new Uint8Array(source)
-  }
-
-  return decoders[encoding || 'utf8'](source)
-}
-
-function from_hex(str) {
-  var size = str.length / 2
-    , buf = new Uint8Array(size)
-    , character = ''
-
-  for(var i = 0, len = str.length; i < len; ++i) {
-    character += str.charAt(i)
-
-    if(i > 0 && (i % 2) === 1) {
-      buf[i>>>1] = parseInt(character, 16)
-      character = '' 
-    }
-  }
-
-  return buf 
-}
-
-function from_utf(str) {
-  var arr = []
-    , code
-
-  for(var i = 0, len = str.length; i < len; ++i) {
-    code = fixed_cca(str, i)
-
-    if(code === false) {
-      continue
-    }
-
-    if(code < 0x80) {
-      arr[arr.length] = code
-
-      continue
-    }
-
-    codepoint_to_bytes(arr, code)
-  }
-
-  return new Uint8Array(arr)
-}
-
-function codepoint_to_bytes(arr, code) {
-  // find MSB, use that to determine byte count
-  var copy_code = code
-    , bit_count = 0
-    , byte_count
-    , prefix
-    , _byte
-    , pos
-
-  do {
-    ++bit_count
-  } while(copy_code >>>= 1)
-
-  byte_count = Math.ceil((bit_count - 1) / 5) | 0
-  prefix = [0, 0, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc][byte_count]
-  pos = [0, 0, 3, 4, 5, 6, 7][byte_count]
-
-  _byte |= prefix
-
-  bit_count = (7 - pos) + 6 * (byte_count - 1)
-
-  while(bit_count) {
-    _byte |= +!!(code & (1 << bit_count)) << (7 - pos)
-    ++pos
-
-    if(pos % 8 === 0) {
-      arr[arr.length] = _byte
-      _byte = 0x80
-      pos = 2
-    }
-
-    --bit_count
-  }
-
-  if(pos) {
-    _byte |= +!!(code & 1) << (7 - pos)
-    arr[arr.length] = _byte
-  }
-}
-
-function pad(str) {
-  while(str.length < 8) {
-    str = '0' + str
-  }
-
-  return str
-}
-
-function fixed_cca(str, idx) {
-  idx = idx || 0
-
-  var code = str.charCodeAt(idx)
-    , lo
-    , hi
-
-  if(0xD800 <= code && code <= 0xDBFF) {
-    lo = str.charCodeAt(idx + 1)
-    hi = code
-
-    if(isNaN(lo)) {
-      throw new Error('High surrogate not followed by low surrogate')
-    }
-
-    return ((hi - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000
-  }
-
-  if(0xDC00 <= code && code <= 0xDFFF) {
-    return false
-  }
-
-  return code
-}
-
-function from_base64(str) {
-  return new Uint8Array(base64.toByteArray(str)) 
-}
-
-},{"base64-js":56}],61:[function(require,module,exports){
-
-module.exports = function(buffer) {
-  return buffer instanceof Uint8Array;
-}
-
-},{}],62:[function(require,module,exports){
-module.exports = join
-
-function join(targets, hint) {
-  if(!targets.length) {
-    return new Uint8Array(0)
-  }
-
-  var len = hint !== undefined ? hint : get_length(targets)
-    , out = new Uint8Array(len)
-    , cur = targets[0]
-    , curlen = cur.length
-    , curidx = 0
-    , curoff = 0
-    , i = 0
-
-  while(i < len) {
-    if(curoff === curlen) {
-      curoff = 0
-      ++curidx
-      cur = targets[curidx]
-      curlen = cur && cur.length
-      continue
-    }
-    out[i++] = cur[curoff++] 
-  }
-
-  return out
-}
-
-function get_length(targets) {
-  var size = 0
-  for(var i = 0, len = targets.length; i < len; ++i) {
-    size += targets[i].byteLength
-  }
-  return size
-}
-
-},{}],63:[function(require,module,exports){
-var proto
-  , map
-
-module.exports = proto = {}
-
-map = typeof WeakMap === 'undefined' ? null : new WeakMap
-
-proto.get = !map ? no_weakmap_get : get
-
-function no_weakmap_get(target) {
-  return new DataView(target.buffer, 0)
-}
-
-function get(target) {
-  var out = map.get(target.buffer)
-  if(!out) {
-    map.set(target.buffer, out = new DataView(target.buffer, 0))
-  }
-  return out
-}
-
-},{}],64:[function(require,module,exports){
-module.exports = {
-    readUInt8:      read_uint8
-  , readInt8:       read_int8
-  , readUInt16LE:   read_uint16_le
-  , readUInt32LE:   read_uint32_le
-  , readInt16LE:    read_int16_le
-  , readInt32LE:    read_int32_le
-  , readFloatLE:    read_float_le
-  , readDoubleLE:   read_double_le
-  , readUInt16BE:   read_uint16_be
-  , readUInt32BE:   read_uint32_be
-  , readInt16BE:    read_int16_be
-  , readInt32BE:    read_int32_be
-  , readFloatBE:    read_float_be
-  , readDoubleBE:   read_double_be
-}
-
-var map = require('./mapped.js')
-
-function read_uint8(target, at) {
-  return target[at]
-}
-
-function read_int8(target, at) {
-  var v = target[at];
-  return v < 0x80 ? v : v - 0x100
-}
-
-function read_uint16_le(target, at) {
-  var dv = map.get(target);
-  return dv.getUint16(at + target.byteOffset, true)
-}
-
-function read_uint32_le(target, at) {
-  var dv = map.get(target);
-  return dv.getUint32(at + target.byteOffset, true)
-}
-
-function read_int16_le(target, at) {
-  var dv = map.get(target);
-  return dv.getInt16(at + target.byteOffset, true)
-}
-
-function read_int32_le(target, at) {
-  var dv = map.get(target);
-  return dv.getInt32(at + target.byteOffset, true)
-}
-
-function read_float_le(target, at) {
-  var dv = map.get(target);
-  return dv.getFloat32(at + target.byteOffset, true)
-}
-
-function read_double_le(target, at) {
-  var dv = map.get(target);
-  return dv.getFloat64(at + target.byteOffset, true)
-}
-
-function read_uint16_be(target, at) {
-  var dv = map.get(target);
-  return dv.getUint16(at + target.byteOffset, false)
-}
-
-function read_uint32_be(target, at) {
-  var dv = map.get(target);
-  return dv.getUint32(at + target.byteOffset, false)
-}
-
-function read_int16_be(target, at) {
-  var dv = map.get(target);
-  return dv.getInt16(at + target.byteOffset, false)
-}
-
-function read_int32_be(target, at) {
-  var dv = map.get(target);
-  return dv.getInt32(at + target.byteOffset, false)
-}
-
-function read_float_be(target, at) {
-  var dv = map.get(target);
-  return dv.getFloat32(at + target.byteOffset, false)
-}
-
-function read_double_be(target, at) {
-  var dv = map.get(target);
-  return dv.getFloat64(at + target.byteOffset, false)
-}
-
-},{"./mapped.js":63}],65:[function(require,module,exports){
-module.exports = subarray
-
-function subarray(buf, from, to) {
-  return buf.subarray(from || 0, to || buf.length)
-}
-
-},{}],66:[function(require,module,exports){
-module.exports = to
-
-var base64 = require('base64-js')
-  , toutf8 = require('to-utf8')
-
-var encoders = {
-    hex: to_hex
-  , utf8: to_utf
-  , base64: to_base64
-}
-
-function to(buf, encoding) {
-  return encoders[encoding || 'utf8'](buf)
-}
-
-function to_hex(buf) {
-  var str = ''
-    , byt
-
-  for(var i = 0, len = buf.length; i < len; ++i) {
-    byt = buf[i]
-    str += ((byt & 0xF0) >>> 4).toString(16)
-    str += (byt & 0x0F).toString(16)
-  }
-
-  return str
-}
-
-function to_utf(buf) {
-  return toutf8(buf)
-}
-
-function to_base64(buf) {
-  return base64.fromByteArray(buf)
-}
-
-
-},{"base64-js":56,"to-utf8":57}],67:[function(require,module,exports){
-module.exports = {
-    writeUInt8:      write_uint8
-  , writeInt8:       write_int8
-  , writeUInt16LE:   write_uint16_le
-  , writeUInt32LE:   write_uint32_le
-  , writeInt16LE:    write_int16_le
-  , writeInt32LE:    write_int32_le
-  , writeFloatLE:    write_float_le
-  , writeDoubleLE:   write_double_le
-  , writeUInt16BE:   write_uint16_be
-  , writeUInt32BE:   write_uint32_be
-  , writeInt16BE:    write_int16_be
-  , writeInt32BE:    write_int32_be
-  , writeFloatBE:    write_float_be
-  , writeDoubleBE:   write_double_be
-}
-
-var map = require('./mapped.js')
-
-function write_uint8(target, value, at) {
-  return target[at] = value
-}
-
-function write_int8(target, value, at) {
-  return target[at] = value < 0 ? value + 0x100 : value
-}
-
-function write_uint16_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setUint16(at + target.byteOffset, value, true)
-}
-
-function write_uint32_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setUint32(at + target.byteOffset, value, true)
-}
-
-function write_int16_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setInt16(at + target.byteOffset, value, true)
-}
-
-function write_int32_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setInt32(at + target.byteOffset, value, true)
-}
-
-function write_float_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setFloat32(at + target.byteOffset, value, true)
-}
-
-function write_double_le(target, value, at) {
-  var dv = map.get(target);
-  return dv.setFloat64(at + target.byteOffset, value, true)
-}
-
-function write_uint16_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setUint16(at + target.byteOffset, value, false)
-}
-
-function write_uint32_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setUint32(at + target.byteOffset, value, false)
-}
-
-function write_int16_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setInt16(at + target.byteOffset, value, false)
-}
-
-function write_int32_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setInt32(at + target.byteOffset, value, false)
-}
-
-function write_float_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setFloat32(at + target.byteOffset, value, false)
-}
-
-function write_double_be(target, value, at) {
-  var dv = map.get(target);
-  return dv.setFloat64(at + target.byteOffset, value, false)
-}
-
-},{"./mapped.js":63}],68:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./util":51,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"concat-stream":53,"stream":15,"util":23,"xtend":72}],53:[function(require,module,exports){
 (function (Buffer){
 var stream = require('stream')
 var util = require('util')
@@ -9127,10 +8133,9 @@ module.exports = function(cb) {
 module.exports.ConcatStream = ConcatStream
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":5,"stream":18,"util":26}],69:[function(require,module,exports){
-(function (process){
+},{"buffer":2,"stream":15,"util":23}],54:[function(require,module,exports){
+(function (process,Buffer){
 var util              = require('util')
-  , bops              = require('bops')
   , AbstractLevelDOWN = require('abstract-leveldown').AbstractLevelDOWN
 
 function DeferredLevelDOWN (location) {
@@ -9168,7 +8173,7 @@ DeferredLevelDOWN.prototype._operation = function (method, args) {
 })
 
 DeferredLevelDOWN.prototype._isBuffer = function (obj) {
-  return bops.is(obj)
+  return Buffer.isBuffer(obj)
 }
 
 // don't need to implement this as LevelUP's ReadStream checks for 'ready' state
@@ -9177,8 +8182,9 @@ DeferredLevelDOWN.prototype._iterator = function () {
 }
 
 module.exports = DeferredLevelDOWN
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"abstract-leveldown":72,"bops":73,"util":26}],70:[function(require,module,exports){
+
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"abstract-leveldown":57,"buffer":2,"util":23}],55:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
@@ -9261,8 +8267,8 @@ AbstractChainedBatch.prototype.write = function (options, callback) {
 }
 
 module.exports = AbstractChainedBatch
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16}],71:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13}],56:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
@@ -9314,12 +8320,13 @@ AbstractIterator.prototype.end = function (callback) {
 
 module.exports = AbstractIterator
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16}],72:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13}],57:[function(require,module,exports){
 (function (process,Buffer){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
-var AbstractIterator     = require('./abstract-iterator')
+var xtend                = require('xtend')
+  , AbstractIterator     = require('./abstract-iterator')
   , AbstractChainedBatch = require('./abstract-chained-batch')
 
 function AbstractLevelDOWN (location) {
@@ -9335,8 +8342,10 @@ function AbstractLevelDOWN (location) {
 AbstractLevelDOWN.prototype.open = function (options, callback) {
   if (typeof options == 'function')
     callback = options
+
   if (typeof callback != 'function')
     throw new Error('open() requires a callback argument')
+
   if (typeof options != 'object')
     options = {}
 
@@ -9357,38 +8366,55 @@ AbstractLevelDOWN.prototype.close = function (callback) {
 }
 
 AbstractLevelDOWN.prototype.get = function (key, options, callback) {
-  var self = this
+  var err
+
   if (typeof options == 'function')
     callback = options
+
   if (typeof callback != 'function')
     throw new Error('get() requires a callback argument')
-  var err = self._checkKeyValue(key, 'key', self._isBuffer)
-  if (err) return callback(err)
-  if (!self._isBuffer(key)) key = String(key)
+
+  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
+    return callback(err)
+
+  if (!this._isBuffer(key))
+    key = String(key)
+
   if (typeof options != 'object')
     options = {}
 
-  if (typeof self._get == 'function')
-    return self._get(key, options, callback)
+  if (typeof this._get == 'function')
+    return this._get(key, options, callback)
 
   process.nextTick(function () { callback(new Error('NotFound')) })
 }
 
 AbstractLevelDOWN.prototype.put = function (key, value, options, callback) {
+  var err
+
   if (typeof options == 'function')
     callback = options
+
   if (typeof callback != 'function')
     throw new Error('put() requires a callback argument')
-  var err = this._checkKeyValue(key, 'key', this._isBuffer)
-  if (err) return callback(err)
-  err = this._checkKeyValue(value, 'value', this._isBuffer)
-  if (err) return callback(err)
-  if (!this._isBuffer(key)) key = String(key)
-  // coerce value to string in node, dont touch it in browser
+
+  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
+    return callback(err)
+
+  if (err = this._checkKeyValue(value, 'value', this._isBuffer))
+    return callback(err)
+
+  if (!this._isBuffer(key))
+    key = String(key)
+
+  // coerce value to string in node, don't touch it in browser
   // (indexeddb can store any JS type)
-  if (!this._isBuffer(value) && !process.browser) value = String(value)
+  if (!this._isBuffer(value) && !process.browser)
+    value = String(value)
+
   if (typeof options != 'object')
     options = {}
+
   if (typeof this._put == 'function')
     return this._put(key, value, options, callback)
 
@@ -9396,16 +8422,22 @@ AbstractLevelDOWN.prototype.put = function (key, value, options, callback) {
 }
 
 AbstractLevelDOWN.prototype.del = function (key, options, callback) {
+  var err
+
   if (typeof options == 'function')
     callback = options
+
   if (typeof callback != 'function')
     throw new Error('del() requires a callback argument')
-  var err = this._checkKeyValue(key, 'key', this._isBuffer)
-  if (err) return callback(err)
-  if (!this._isBuffer(key)) key = String(key)
+
+  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
+    return callback(err)
+
+  if (!this._isBuffer(key))
+    key = String(key)
+
   if (typeof options != 'object')
     options = {}
-
 
   if (typeof this._del == 'function')
     return this._del(key, options, callback)
@@ -9419,10 +8451,13 @@ AbstractLevelDOWN.prototype.batch = function (array, options, callback) {
 
   if (typeof options == 'function')
     callback = options
+
   if (typeof callback != 'function')
     throw new Error('batch(array) requires a callback argument')
+
   if (!Array.isArray(array))
     return callback(new Error('batch(array) requires an array argument'))
+
   if (typeof options != 'object')
     options = {}
 
@@ -9433,17 +8468,18 @@ AbstractLevelDOWN.prototype.batch = function (array, options, callback) {
 
   for (; i < l; i++) {
     e = array[i]
-    if (typeof e != 'object') continue;
+    if (typeof e != 'object')
+      continue
 
-    err = this._checkKeyValue(e.type, 'type', this._isBuffer)
-    if (err) return callback(err)
+    if (err = this._checkKeyValue(e.type, 'type', this._isBuffer))
+      return callback(err)
 
-    err = this._checkKeyValue(e.key, 'key', this._isBuffer)
-    if (err) return callback(err)
+    if (err = this._checkKeyValue(e.key, 'key', this._isBuffer))
+      return callback(err)
 
     if (e.type == 'put') {
-      err = this._checkKeyValue(e.value, 'value', this._isBuffer)
-      if (err) return callback(err)
+      if (err = this._checkKeyValue(e.value, 'value', this._isBuffer))
+        return callback(err)
     }
   }
 
@@ -9453,23 +8489,66 @@ AbstractLevelDOWN.prototype.batch = function (array, options, callback) {
   process.nextTick(callback)
 }
 
+//TODO: remove from here, not a necessary primitive
 AbstractLevelDOWN.prototype.approximateSize = function (start, end, callback) {
-  if (start == null || end == null || typeof start == 'function' || typeof end == 'function')
+  if (   start == null
+      || end == null
+      || typeof start == 'function'
+      || typeof end == 'function') {
     throw new Error('approximateSize() requires valid `start`, `end` and `callback` arguments')
+  }
+
   if (typeof callback != 'function')
     throw new Error('approximateSize() requires a callback argument')
 
-  if (!this._isBuffer(start)) start = String(start)
-  if (!this._isBuffer(end)) end = String(end)
+  if (!this._isBuffer(start))
+    start = String(start)
+
+  if (!this._isBuffer(end))
+    end = String(end)
+
   if (typeof this._approximateSize == 'function')
     return this._approximateSize(start, end, callback)
 
-  process.nextTick(function () { callback(null, 0) })
+  process.nextTick(function () {
+    callback(null, 0)
+  })
+}
+
+AbstractLevelDOWN.prototype._setupIteratorOptions = function (options) {
+  var self = this
+
+  options = xtend(options)
+
+  ;[ 'start', 'end', 'gt', 'gte', 'lt', 'lte' ].forEach(function (o) {
+    if (options[o] && self._isBuffer(options[o]) && options[o].length === 0)
+      delete options[o]
+  })
+
+  options.reverse = !!options.reverse
+
+  // fix `start` so it takes into account gt, gte, lt, lte as appropriate
+  if (options.reverse && options.lt)
+    options.start = options.lt
+  if (options.reverse && options.lte)
+    options.start = options.lte
+  if (!options.reverse && options.gt)
+    options.start = options.gt
+  if (!options.reverse && options.gte)
+    options.start = options.gte
+
+  if ((options.reverse && options.lt && !options.lte)
+    || (!options.reverse && options.gt && !options.gte))
+    options.exclusiveStart = true // start should *not* include matching key
+
+  return options
 }
 
 AbstractLevelDOWN.prototype.iterator = function (options) {
   if (typeof options != 'object')
     options = {}
+
+  options = this._setupIteratorOptions(options)
 
   if (typeof this._iterator == 'function')
     return this._iterator(options)
@@ -9488,8 +8567,10 @@ AbstractLevelDOWN.prototype._isBuffer = function (obj) {
 AbstractLevelDOWN.prototype._checkKeyValue = function (obj, type) {
   if (obj === null || obj === undefined)
     return new Error(type + ' cannot be `null` or `undefined`')
+
   if (obj === null || obj === undefined)
     return new Error(type + ' cannot be `null` or `undefined`')
+
   if (this._isBuffer(obj)) {
     if (obj.length === 0)
       return new Error(type + ' cannot be an empty Buffer')
@@ -9501,92 +8582,8 @@ module.exports.AbstractLevelDOWN    = AbstractLevelDOWN
 module.exports.AbstractIterator     = AbstractIterator
 module.exports.AbstractChainedBatch = AbstractChainedBatch
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
-},{"./abstract-chained-batch":70,"./abstract-iterator":71,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"buffer":5}],73:[function(require,module,exports){
-arguments[4][55][0].apply(exports,arguments)
-},{"./copy.js":76,"./create.js":77,"./from.js":78,"./is.js":79,"./join.js":80,"./read.js":82,"./subarray.js":83,"./to.js":84,"./write.js":85}],74:[function(require,module,exports){
-module.exports=require(56)
-},{}],75:[function(require,module,exports){
-module.exports=require(57)
-},{}],76:[function(require,module,exports){
-module.exports=require(58)
-},{}],77:[function(require,module,exports){
-module.exports=require(59)
-},{}],78:[function(require,module,exports){
-module.exports = from
-
-var base64 = require('base64-js')
-
-var decoders = {
-    hex: from_hex
-  , utf8: from_utf
-  , base64: from_base64
-}
-
-function from(source, encoding) {
-  if(Array.isArray(source)) {
-    return new Uint8Array(source)
-  }
-
-  return decoders[encoding || 'utf8'](source)
-}
-
-function from_hex(str) {
-  var size = str.length / 2
-    , buf = new Uint8Array(size)
-    , character = ''
-
-  for(var i = 0, len = str.length; i < len; ++i) {
-    character += str.charAt(i)
-
-    if(i > 0 && (i % 2) === 1) {
-      buf[i>>>1] = parseInt(character, 16)
-      character = '' 
-    }
-  }
-
-  return buf 
-}
-
-function from_utf(str) {
-  var bytes = []
-    , tmp
-    , ch
-
-  for(var i = 0, len = str.length; i < len; ++i) {
-    ch = str.charCodeAt(i)
-    if(ch & 0x80) {
-      tmp = encodeURIComponent(str.charAt(i)).substr(1).split('%')
-      for(var j = 0, jlen = tmp.length; j < jlen; ++j) {
-        bytes[bytes.length] = parseInt(tmp[j], 16)
-      }
-    } else {
-      bytes[bytes.length] = ch 
-    }
-  }
-
-  return new Uint8Array(bytes)
-}
-
-function from_base64(str) {
-  return new Uint8Array(base64.toByteArray(str)) 
-}
-
-},{"base64-js":74}],79:[function(require,module,exports){
-module.exports=require(61)
-},{}],80:[function(require,module,exports){
-module.exports=require(62)
-},{}],81:[function(require,module,exports){
-module.exports=require(63)
-},{}],82:[function(require,module,exports){
-module.exports=require(64)
-},{"./mapped.js":81}],83:[function(require,module,exports){
-module.exports=require(65)
-},{}],84:[function(require,module,exports){
-module.exports=require(66)
-},{"base64-js":74,"to-utf8":75}],85:[function(require,module,exports){
-module.exports=require(67)
-},{"./mapped.js":81}],86:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
+},{"./abstract-chained-batch":55,"./abstract-iterator":56,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"xtend":72}],58:[function(require,module,exports){
 var prr = require('prr')
 
 function init (type, message, cause) {
@@ -9643,7 +8640,7 @@ module.exports = function (errno) {
   }
 }
 
-},{"prr":88}],87:[function(require,module,exports){
+},{"prr":60}],59:[function(require,module,exports){
 var all = module.exports.all = [
  {
   "errno": -1,
@@ -10071,7 +9068,7 @@ module.exports.code = {
 
 module.exports.custom = require("./custom")(module.exports)
 module.exports.create = module.exports.custom.createError
-},{"./custom":86}],88:[function(require,module,exports){
+},{"./custom":58}],60:[function(require,module,exports){
 /*!
   * prr
   * (c) 2013 Rod Vagg <rod@vagg.org>
@@ -10135,7 +9132,7 @@ module.exports.create = module.exports.custom.createError
 
   return prr
 })
-},{}],89:[function(require,module,exports){
+},{}],61:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -10227,8 +9224,8 @@ function forEach (xs, f) {
   }
 }
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./_stream_readable":91,"./_stream_writable":93,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"core-util-is":94,"inherits":95}],90:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./_stream_readable":63,"./_stream_writable":65,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"core-util-is":66,"inherits":67}],62:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -10276,7 +9273,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./_stream_transform":92,"core-util-is":94,"inherits":95}],91:[function(require,module,exports){
+},{"./_stream_transform":64,"core-util-is":66,"inherits":67}],63:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -11238,8 +10235,8 @@ function indexOf (xs, x) {
   return -1;
 }
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"buffer":5,"core-util-is":94,"events":14,"inherits":95,"isarray":96,"stream":18,"string_decoder/":97}],92:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"core-util-is":66,"events":11,"inherits":67,"isarray":68,"stream":15,"string_decoder/":69}],64:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -11451,7 +10448,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./_stream_duplex":89,"core-util-is":94,"inherits":95}],93:[function(require,module,exports){
+},{"./_stream_duplex":61,"core-util-is":66,"inherits":67}],65:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -11841,8 +10838,8 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./_stream_duplex":89,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"buffer":5,"core-util-is":94,"inherits":95,"stream":18}],94:[function(require,module,exports){
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"./_stream_duplex":61,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"core-util-is":66,"inherits":67,"stream":15}],66:[function(require,module,exports){
 (function (Buffer){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -11952,14 +10949,14 @@ function objectToString(o) {
   return Object.prototype.toString.call(o);
 }
 }).call(this,require("buffer").Buffer)
-},{"buffer":5}],95:[function(require,module,exports){
-module.exports=require(15)
-},{}],96:[function(require,module,exports){
+},{"buffer":2}],67:[function(require,module,exports){
+module.exports=require(12)
+},{}],68:[function(require,module,exports){
 module.exports = Array.isArray || function (arr) {
   return Object.prototype.toString.call(arr) == '[object Array]';
 };
 
-},{}],97:[function(require,module,exports){
+},{}],69:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -12161,7 +11158,7 @@ function base64DetectIncompleteChar(buffer) {
   return incomplete;
 }
 
-},{"buffer":5}],98:[function(require,module,exports){
+},{"buffer":2}],70:[function(require,module,exports){
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Readable = exports;
 exports.Writable = require('./lib/_stream_writable.js');
@@ -12169,23 +11166,23 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":89,"./lib/_stream_passthrough.js":90,"./lib/_stream_readable.js":91,"./lib/_stream_transform.js":92,"./lib/_stream_writable.js":93}],99:[function(require,module,exports){
-module.exports=require(34)
-},{}],100:[function(require,module,exports){
-arguments[4][35][0].apply(exports,arguments)
-},{"./has-keys":99,"object-keys":102}],101:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":61,"./lib/_stream_passthrough.js":62,"./lib/_stream_readable.js":63,"./lib/_stream_transform.js":64,"./lib/_stream_writable.js":65}],71:[function(require,module,exports){
+module.exports=require(32)
+},{}],72:[function(require,module,exports){
+arguments[4][33][0].apply(exports,arguments)
+},{"./has-keys":71,"object-keys":74}],73:[function(require,module,exports){
+module.exports=require(43)
+},{}],74:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"./shim":76}],75:[function(require,module,exports){
 module.exports=require(45)
-},{}],102:[function(require,module,exports){
-arguments[4][36][0].apply(exports,arguments)
-},{"./shim":104}],103:[function(require,module,exports){
-module.exports=require(47)
-},{}],104:[function(require,module,exports){
-module.exports=require(48)
-},{"./foreach":101,"./isArguments":103}],105:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
+module.exports=require(46)
+},{"./foreach":73,"./isArguments":75}],77:[function(require,module,exports){
 module.exports={
   "name": "levelup",
   "description": "Fast & simple storage - a Node.js-style LevelDB wrapper",
-  "version": "0.18.2",
+  "version": "0.18.3",
   "contributors": [
     {
       "name": "Rod Vagg",
@@ -12275,8 +11272,7 @@ module.exports={
     "xtend": "~2.1.1",
     "prr": "~0.0.0",
     "semver": "~2.2.1",
-    "bops": "~0.1.0",
-    "deferred-leveldown": "~0.1.0"
+    "deferred-leveldown": "~0.2.0"
   },
   "devDependencies": {
     "leveldown": "~0.10.0",
@@ -12307,16 +11303,16 @@ module.exports={
     "alltests": "npm test && npm run-script functionaltests"
   },
   "license": "MIT",
-  "readme": "LevelUP\n=======\n\n![LevelDB Logo](https://twimg0-a.akamaihd.net/profile_images/3360574989/92fc472928b444980408147e5e5db2fa_bigger.png)\n\nFast & simple storage - a Node.js-style LevelDB wrapper\n-------------------------------------------------------\n\n[![Build Status](https://secure.travis-ci.org/rvagg/node-levelup.png)](http://travis-ci.org/rvagg/node-levelup)\n\n[![NPM](https://nodei.co/npm/levelup.png?stars&downloads)](https://nodei.co/npm/levelup/) [![NPM](https://nodei.co/npm-dl/levelup.png)](https://nodei.co/npm/levelup/)\n\n\n  * <a href=\"#intro\">Introduction</a>\n  * <a href=\"#leveldown\">Relationship to LevelDOWN</a>\n  * <a href=\"#platforms\">Tested &amp; supported platforms</a>\n  * <a href=\"#basic\">Basic usage</a>\n  * <a href=\"#api\">API</a>\n  * <a href=\"#events\">Events</a>\n  * <a href=\"#json\">JSON data</a>\n  * <a href=\"#custom_encodings\">Custom encodings</a>\n  * <a href=\"#extending\">Extending LevelUP</a>\n  * <a href=\"#multiproc\">Multi-process access</a>\n  * <a href=\"#support\">Getting support</a>\n  * <a href=\"#contributing\">Contributing</a>\n  * <a href=\"#licence\">Licence &amp; copyright</a>\n\n<a name=\"intro\"></a>\nIntroduction\n------------\n\n**[LevelDB](http://code.google.com/p/leveldb/)** is a simple key/value data store built by Google, inspired by BigTable. It's used in Google Chrome and many other products. LevelDB supports arbitrary byte arrays as both keys and values, singular *get*, *put* and *delete* operations, *batched put and delete*, bi-directional iterators and simple compression using the very fast [Snappy](http://code.google.com/p/snappy/) algorithm.\n\n**LevelUP** aims to expose the features of LevelDB in a **Node.js-friendly way**. All standard `Buffer` encoding types are supported, as is a special JSON encoding. LevelDB's iterators are exposed as a Node.js-style **readable stream** a matching **writeable stream** converts writes to *batch* operations.\n\nLevelDB stores entries **sorted lexicographically by keys**. This makes LevelUP's <a href=\"#createReadStream\"><code>ReadStream</code></a> interface a very powerful query mechanism.\n\n**LevelUP** is an **OPEN Open Source Project**, see the <a href=\"#contributing\">Contributing</a> section to find out what this means.\n\n<a name=\"leveldown\"></a>\nRelationship to LevelDOWN\n-------------------------\n\nLevelUP is designed to be backed by **[LevelDOWN](https://github.com/rvagg/node-leveldown/)** which provides a pure C++ binding to LevelDB and can be used as a stand-alone package if required.\n\n**As of version 0.9, LevelUP no longer requires LevelDOWN as a dependency so you must `npm install leveldown` when you install LevelUP.**\n\nLevelDOWN is now optional because LevelUP can be used with alternative backends, such as **[level.js](https://github.com/maxogden/level.js)** in the browser or [MemDOWN](https://github.com/rvagg/node-memdown) for a pure in-memory store.\n\nLevelUP will look for LevelDOWN and throw an error if it can't find it in its Node `require()` path. It will also tell you if the installed version of LevelDOWN is incompatible.\n\n**The [level](https://github.com/level/level) package is available as an alternative installation mechanism.** Install it instead to automatically get both LevelUP & LevelDOWN. It exposes LevelUP on its export (i.e. you can `var leveldb = require('level')`).\n\n\n<a name=\"platforms\"></a>\nTested & supported platforms\n----------------------------\n\n  * **Linux**: including ARM platforms such as Raspberry Pi *and Kindle!*\n  * **Mac OS**\n  * **Solaris**: including Joyent's SmartOS & Nodejitsu\n  * **Windows**: Node 0.10 and above only. See installation instructions for *node-gyp's* dependencies [here](https://github.com/TooTallNate/node-gyp#installation), you'll need these (free) components from Microsoft to compile and run any native Node add-on in Windows.\n\n<a name=\"basic\"></a>\nBasic usage\n-----------\n\nFirst you need to install LevelUP!\n\n```sh\n$ npm install levelup leveldown\n```\n\nOr\n\n```sh\n$ npm install level\n```\n\n*(this second option requires you to use LevelUP by calling `var levelup = require('level')`)*\n\n\nAll operations are asynchronous although they don't necessarily require a callback if you don't need to know when the operation was performed.\n\n```js\nvar levelup = require('levelup')\n\n// 1) Create our database, supply location and options.\n//    This will create or open the underlying LevelDB store.\nvar db = levelup('./mydb')\n\n// 2) put a key & value\ndb.put('name', 'LevelUP', function (err) {\n  if (err) return console.log('Ooops!', err) // some kind of I/O error\n\n  // 3) fetch by key\n  db.get('name', function (err, value) {\n    if (err) return console.log('Ooops!', err) // likely the key was not found\n\n    // ta da!\n    console.log('name=' + value)\n  })\n})\n```\n\n<a name=\"api\"></a>\n## API\n\n  * <a href=\"#ctor\"><code><b>levelup()</b></code></a>\n  * <a href=\"#open\"><code>db.<b>open()</b></code></a>\n  * <a href=\"#close\"><code>db.<b>close()</b></code></a>\n  * <a href=\"#put\"><code>db.<b>put()</b></code></a>\n  * <a href=\"#get\"><code>db.<b>get()</b></code></a>\n  * <a href=\"#del\"><code>db.<b>del()</b></code></a>\n  * <a href=\"#batch\"><code>db.<b>batch()</b></code> *(array form)*</a>\n  * <a href=\"#batch_chained\"><code>db.<b>batch()</b></code> *(chained form)*</a>\n  * <a href=\"#isOpen\"><code>db.<b>isOpen()</b></code></a>\n  * <a href=\"#isClosed\"><code>db.<b>isClosed()</b></code></a>\n  * <a href=\"#createReadStream\"><code>db.<b>createReadStream()</b></code></a>\n  * <a href=\"#createKeyStream\"><code>db.<b>createKeyStream()</b></code></a>\n  * <a href=\"#createValueStream\"><code>db.<b>createValueStream()</b></code></a>\n  * <a href=\"#createWriteStream\"><code>db.<b>createWriteStream()</b></code></a>\n\n### Special operations exposed by LevelDOWN\n\n  * <a href=\"#approximateSize\"><code>db.db.<b>approximateSize()</b></code></a>\n  * <a href=\"#getProperty\"><code>db.db.<b>getProperty()</b></code></a>\n  * <a href=\"#destroy\"><code><b>leveldown.destroy()</b></code></a>\n  * <a href=\"#repair\"><code><b>leveldown.repair()</b></code></a>\n\n\n--------------------------------------------------------\n<a name=\"ctor\"></a>\n### levelup(location[, options[, callback]])\n### levelup(options[, callback ])\n### levelup(db[, callback ])\n<code>levelup()</code> is the main entry point for creating a new LevelUP instance and opening the underlying store with LevelDB.\n\nThis function returns a new instance of LevelUP and will also initiate an <a href=\"#open\"><code>open()</code></a> operation. Opening the database is an asynchronous operation which will trigger your callback if you provide one. The callback should take the form: `function (err, db) {}` where the `db` is the LevelUP instance. If you don't provide a callback, any read & write operations are simply queued internally until the database is fully opened.\n\nThis leads to two alternative ways of managing a new LevelUP instance:\n\n```js\nlevelup(location, options, function (err, db) {\n  if (err) throw err\n  db.get('foo', function (err, value) {\n    if (err) return console.log('foo does not exist')\n    console.log('got foo =', value)\n  })\n})\n\n// vs the equivalent:\n\nvar db = levelup(location, options) // will throw if an error occurs\ndb.get('foo', function (err, value) {\n  if (err) return console.log('foo does not exist')\n  console.log('got foo =', value)\n})\n```\n\nThe `location` argument is available as a read-only property on the returned LevelUP instance.\n\nThe `levelup(options, callback)` form (with optional `callback`) is only available where you provide a valid `'db'` property on the options object (see below). Only for back-ends that don't require a `location` argument, such as [MemDOWN](https://github.com/rvagg/memdown).\n\nFor example:\n\n```js\nvar levelup = require('levelup')\nvar memdown = require('memdown')\nvar db = levelup({ db: memdown })\n```\n\nThe `levelup(db, callback)` form (with optional `callback`) is only available where `db` is a factory function, as would be provided as a `'db'` property on an `options` object (see below). Only for back-ends that don't require a `location` argument, such as [MemDOWN](https://github.com/rvagg/memdown).\n\nFor example:\n\n```js\nvar levelup = require('levelup')\nvar memdown = require('memdown')\nvar db = levelup(memdown)\n```\n\n#### `options`\n\n`levelup()` takes an optional options object as its second argument; the following properties are accepted:\n\n* `'createIfMissing'` *(boolean, default: `true`)*: If `true`, will initialise an empty database at the specified location if one doesn't already exist. If `false` and a database doesn't exist you will receive an error in your `open()` callback and your database won't open.\n\n* `'errorIfExists'` *(boolean, default: `false`)*: If `true`, you will receive an error in your `open()` callback if the database exists at the specified location.\n\n* `'compression'` *(boolean, default: `true`)*: If `true`, all *compressible* data will be run through the Snappy compression algorithm before being stored. Snappy is very fast and shouldn't gain much speed by disabling so leave this on unless you have good reason to turn it off.\n\n* `'cacheSize'` *(number, default: `8 * 1024 * 1024`)*: The size (in bytes) of the in-memory [LRU](http://en.wikipedia.org/wiki/Cache_algorithms#Least_Recently_Used) cache with frequently used uncompressed block contents. \n\n* `'keyEncoding'` and `'valueEncoding'` *(string, default: `'utf8'`)*: The encoding of the keys and values passed through Node.js' `Buffer` implementation (see [Buffer#toString()](http://nodejs.org/docs/latest/api/buffer.html#buffer_buf_tostring_encoding_start_end)).\n  <p><code>'utf8'</code> is the default encoding for both keys and values so you can simply pass in strings and expect strings from your <code>get()</code> operations. You can also pass <code>Buffer</code> objects as keys and/or values and conversion will be performed.</p>\n  <p>Supported encodings are: hex, utf8, ascii, binary, base64, ucs2, utf16le.</p>\n  <p><code>'json'</code> encoding is also supported, see below.</p>\n\n* `'db'` *(object, default: LevelDOWN)*: LevelUP is backed by [LevelDOWN](https://github.com/rvagg/node-leveldown/) to provide an interface to LevelDB. You can completely replace the use of LevelDOWN by providing a \"factory\" function that will return a LevelDOWN API compatible object given a `location` argument. For further information, see [MemDOWN](https://github.com/rvagg/node-memdown/), a fully LevelDOWN API compatible replacement that uses a memory store rather than LevelDB. Also see [Abstract LevelDOWN](http://github.com/rvagg/node-abstract-leveldown), a partial implementation of the LevelDOWN API that can be used as a base prototype for a LevelDOWN substitute.\n\nAdditionally, each of the main interface methods accept an optional options object that can be used to override `'keyEncoding'` and `'valueEncoding'`.\n\n--------------------------------------------------------\n<a name=\"open\"></a>\n### db.open([callback])\n<code>open()</code> opens the underlying LevelDB store. In general **you should never need to call this method directly** as it's automatically called by <a href=\"#ctor\"><code>levelup()</code></a>.\n\nHowever, it is possible to *reopen* a database after it has been closed with <a href=\"#close\"><code>close()</code></a>, although this is not generally advised.\n\n--------------------------------------------------------\n<a name=\"close\"></a>\n### db.close([callback])\n<code>close()</code> closes the underlying LevelDB store. The callback will receive any error encountered during closing as the first argument.\n\nYou should always clean up your LevelUP instance by calling `close()` when you no longer need it to free up resources. A LevelDB store cannot be opened by multiple instances of LevelDB/LevelUP simultaneously.\n\n--------------------------------------------------------\n<a name=\"put\"></a>\n### db.put(key, value[, options][, callback])\n<code>put()</code> is the primary method for inserting data into the store. Both the `key` and `value` can be arbitrary data objects.\n\nThe callback argument is optional but if you don't provide one and an error occurs then expect the error to be thrown.\n\n#### `options`\n\nEncoding of the `key` and `value` objects will adhere to `'keyEncoding'` and `'valueEncoding'` options provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `put()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nIf you provide a `'sync'` value of `true` in your `options` object, LevelDB will perform a synchronous write of the data; although the operation will be asynchronous as far as Node is concerned. Normally, LevelDB passes the data to the operating system for writing and returns immediately, however a synchronous write will use `fsync()` or equivalent so your callback won't be triggered until the data is actually on disk. Synchronous filesystem writes are **significantly** slower than asynchronous writes but if you want to be absolutely sure that the data is flushed then you can use `'sync': true`.\n\n--------------------------------------------------------\n<a name=\"get\"></a>\n### db.get(key[, options][, callback])\n<code>get()</code> is the primary method for fetching data from the store. The `key` can be an arbitrary data object. If it doesn't exist in the store then the callback will receive an error as its first argument. A not-found err object will be of type `'NotFoundError'` so you can `err.type == 'NotFoundError'` or you can perform a truthy test on the property `err.notFound`.\n\n```js\ndb.get('foo', function (err, value) {\n  if (err) {\n    if (err.notFound) {\n      // handle a 'NotFoundError' here\n      return\n    }\n    // I/O or other error, pass it up the callback chain\n    return callback(err)\n  }\n\n  // .. handle `value` here\n})\n```\n\n#### `options`\n\nEncoding of the `key` object will adhere to the `'keyEncoding'` option provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `get()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nLevelDB will by default fill the in-memory LRU Cache with data from a call to get. Disabling this is done by setting `fillCache` to `false`. \n\n--------------------------------------------------------\n<a name=\"del\"></a>\n### db.del(key[, options][, callback])\n<code>del()</code> is the primary method for removing data from the store.\n\n#### `options`\n\nEncoding of the `key` object will adhere to the `'keyEncoding'` option provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `del()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nA `'sync'` option can also be passed, see <a href=\"#put\"><code>put()</code></a> for details on how this works.\n\n--------------------------------------------------------\n<a name=\"batch\"></a>\n### db.batch(array[, options][, callback]) *(array form)*\n<code>batch()</code> can be used for very fast bulk-write operations (both *put* and *delete*). The `array` argument should contain a list of operations to be executed sequentially, although as a whole they are performed as an atomic operation inside LevelDB. Each operation is contained in an object having the following properties: `type`, `key`, `value`, where the *type* is either `'put'` or `'del'`. In the case of `'del'` the `'value'` property is ignored. Any entries with a `'key'` of `null` or `undefined` will cause an error to be returned on the `callback` and any `'type': 'put'` entry with a `'value'` of `null` or `undefined` will return an error.\n\n```js\nvar ops = [\n    { type: 'del', key: 'father' }\n  , { type: 'put', key: 'name', value: 'Yuri Irsenovich Kim' }\n  , { type: 'put', key: 'dob', value: '16 February 1941' }\n  , { type: 'put', key: 'spouse', value: 'Kim Young-sook' }\n  , { type: 'put', key: 'occupation', value: 'Clown' }\n]\n\ndb.batch(ops, function (err) {\n  if (err) return console.log('Ooops!', err)\n  console.log('Great success dear leader!')\n})\n```\n\n#### `options`\n\nSee <a href=\"#put\"><code>put()</code></a> for a discussion on the `options` object. You can overwrite default `'keyEncoding'` and `'valueEncoding'` and also specify the use of `sync` filesystem operations.\n\nIn addition to encoding options for the whole batch you can also overwrite the encoding per operation, like:\n\n```js\nvar ops = [{\n    type          : 'put'\n  , key           : new Buffer([1, 2, 3])\n  , value         : { some: 'json' }\n  , keyEncoding   : 'binary'\n  , valueEncoding : 'json'\n}]\n```\n\n--------------------------------------------------------\n<a name=\"batch_chained\"></a>\n### db.batch() *(chained form)*\n<code>batch()</code>, when called with no arguments will return a `Batch` object which can be used to build, and eventually commit, an atomic LevelDB batch operation. Depending on how it's used, it is possible to obtain greater performance when using the chained form of `batch()` over the array form.\n\n```js\ndb.batch()\n  .del('father')\n  .put('name', 'Yuri Irsenovich Kim')\n  .put('dob', '16 February 1941')\n  .put('spouse', 'Kim Young-sook')\n  .put('occupation', 'Clown')\n  .write(function () { console.log('Done!') })\n```\n\n<b><code>batch.put(key, value[, options])</code></b>\n\nQueue a *put* operation on the current batch, not committed until a `write()` is called on the batch.\n\nThe optional `options` argument can be used to override the default `'keyEncoding'` and/or `'valueEncoding'`.\n\nThis method may `throw` a `WriteError` if there is a problem with your put (such as the `value` being `null` or `undefined`).\n\n<b><code>batch.del(key[, options])</code></b>\n\nQueue a *del* operation on the current batch, not committed until a `write()` is called on the batch.\n\nThe optional `options` argument can be used to override the default `'keyEncoding'`.\n\nThis method may `throw` a `WriteError` if there is a problem with your delete.\n\n<b><code>batch.clear()</code></b>\n\nClear all queued operations on the current batch, any previous operations will be discarded.\n\n<b><code>batch.write([callback])</code></b>\n\nCommit the queued operations for this batch. All operations not *cleared* will be written to the database atomically, that is, they will either all succeed or fail with no partial commits. The optional `callback` will be called when the operation has completed with an *error* argument if an error has occurred; if no `callback` is supplied and an error occurs then this method will `throw` a `WriteError`.\n\n\n--------------------------------------------------------\n<a name=\"isOpen\"></a>\n### db.isOpen()\n\nA LevelUP object can be in one of the following states:\n\n  * *\"new\"*     - newly created, not opened or closed\n  * *\"opening\"* - waiting for the database to be opened\n  * *\"open\"*    - successfully opened the database, available for use\n  * *\"closing\"* - waiting for the database to be closed\n  * *\"closed\"*  - database has been successfully closed, should not be used\n\n`isOpen()` will return `true` only when the state is \"open\".\n\n--------------------------------------------------------\n<a name=\"isClosed\"></a>\n### db.isClosed()\n\n*See <a href=\"#put\"><code>isOpen()</code></a>*\n\n`isClosed()` will return `true` only when the state is \"closing\" *or* \"closed\", it can be useful for determining if read and write operations are permissible.\n\n--------------------------------------------------------\n<a name=\"createReadStream\"></a>\n### db.createReadStream([options])\n\nYou can obtain a **ReadStream** of the full database by calling the `createReadStream()` method. The resulting stream is a complete Node.js-style [Readable Stream](http://nodejs.org/docs/latest/api/stream.html#stream_readable_stream) where `'data'` events emit objects with `'key'` and `'value'` pairs.\n\n```js\ndb.createReadStream()\n  .on('data', function (data) {\n    console.log(data.key, '=', data.value)\n  })\n  .on('error', function (err) {\n    console.log('Oh my!', err)\n  })\n  .on('close', function () {\n    console.log('Stream closed')\n  })\n  .on('end', function () {\n    console.log('Stream closed')\n  })\n```\n\nThe standard `pause()`, `resume()` and `destroy()` methods are implemented on the ReadStream, as is `pipe()` (see below). `'data'`, '`error'`, `'end'` and `'close'` events are emitted.\n\nAdditionally, you can supply an options object as the first parameter to `createReadStream()` with the following options:\n\n* `'start'`: the key you wish to start the read at. By default it will start at the beginning of the store. Note that the *start* doesn't have to be an actual key that exists, LevelDB will simply find the *next* key, greater than the key you provide.\n\n* `'end'`: the key you wish to end the read on. By default it will continue until the end of the store. Again, the *end* doesn't have to be an actual key as an (inclusive) `<=`-type operation is performed to detect the end. You can also use the `destroy()` method instead of supplying an `'end'` parameter to achieve the same effect.\n\n* `'reverse'` *(boolean, default: `false`)*: a boolean, set to true if you want the stream to go in reverse order. Beware that due to the way LevelDB works, a reverse seek will be slower than a forward seek.\n\n* `'keys'` *(boolean, default: `true`)*: whether the `'data'` event should contain keys. If set to `true` and `'values'` set to `false` then `'data'` events will simply be keys, rather than objects with a `'key'` property. Used internally by the `createKeyStream()` method.\n\n* `'values'` *(boolean, default: `true`)*: whether the `'data'` event should contain values. If set to `true` and `'keys'` set to `false` then `'data'` events will simply be values, rather than objects with a `'value'` property. Used internally by the `createValueStream()` method.\n\n* `'limit'` *(number, default: `-1`)*: limit the number of results collected by this stream. This number represents a *maximum* number of results and may not be reached if you get to the end of the store or your `'end'` value first. A value of `-1` means there is no limit.\n\n* `'fillCache'` *(boolean, default: `false`)*: wheather LevelDB's LRU-cache should be filled with data read.\n\n* `'keyEncoding'` / `'valueEncoding'` *(string)*: the encoding applied to each read piece of data.\n\n--------------------------------------------------------\n<a name=\"createKeyStream\"></a>\n### db.createKeyStream([options])\n\nA **KeyStream** is a **ReadStream** where the `'data'` events are simply the keys from the database so it can be used like a traditional stream rather than an object stream.\n\nYou can obtain a KeyStream either by calling the `createKeyStream()` method on a LevelUP object or by passing passing an options object to `createReadStream()` with `keys` set to `true` and `values` set to `false`.\n\n```js\ndb.createKeyStream()\n  .on('data', function (data) {\n    console.log('key=', data)\n  })\n\n// same as:\ndb.createReadStream({ keys: true, values: false })\n  .on('data', function (data) {\n    console.log('key=', data)\n  })\n```\n\n--------------------------------------------------------\n<a name=\"createValueStream\"></a>\n### db.createValueStream([options])\n\nA **ValueStream** is a **ReadStream** where the `'data'` events are simply the values from the database so it can be used like a traditional stream rather than an object stream.\n\nYou can obtain a ValueStream either by calling the `createValueStream()` method on a LevelUP object or by passing passing an options object to `createReadStream()` with `values` set to `true` and `keys` set to `false`.\n\n```js\ndb.createValueStream()\n  .on('data', function (data) {\n    console.log('value=', data)\n  })\n\n// same as:\ndb.createReadStream({ keys: false, values: true })\n  .on('data', function (data) {\n    console.log('value=', data)\n  })\n```\n\n--------------------------------------------------------\n<a name=\"createWriteStream\"></a>\n### db.createWriteStream([options])\n\nA **WriteStream** can be obtained by calling the `createWriteStream()` method. The resulting stream is a complete Node.js-style [Writable Stream](http://nodejs.org/docs/latest/api/stream.html#stream_writable_stream) which accepts objects with `'key'` and `'value'` pairs on its `write()` method.\n\nThe WriteStream will buffer writes and submit them as a `batch()` operations where writes occur *within the same tick*.\n\n```js\nvar ws = db.createWriteStream()\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ key: 'name', value: 'Yuri Irsenovich Kim' })\nws.write({ key: 'dob', value: '16 February 1941' })\nws.write({ key: 'spouse', value: 'Kim Young-sook' })\nws.write({ key: 'occupation', value: 'Clown' })\nws.end()\n```\n\nThe standard `write()`, `end()`, `destroy()` and `destroySoon()` methods are implemented on the WriteStream. `'drain'`, `'error'`, `'close'` and `'pipe'` events are emitted.\n\nYou can specify encodings both for the whole stream and individual entries:\n\nTo set the encoding for the whole stream, provide an options object as the first parameter to `createWriteStream()` with `'keyEncoding'` and/or `'valueEncoding'`.\n\nTo set the encoding for an individual entry:\n\n```js\nwriteStream.write({\n    key           : new Buffer([1, 2, 3])\n  , value         : { some: 'json' }\n  , keyEncoding   : 'binary'\n  , valueEncoding : 'json'\n})\n```\n\n#### write({ type: 'put' })\n\nIf individual `write()` operations are performed with a `'type'` property of `'del'`, they will be passed on as `'del'` operations to the batch.\n\n```js\nvar ws = db.createWriteStream()\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ type: 'del', key: 'name' })\nws.write({ type: 'del', key: 'dob' })\nws.write({ type: 'put', key: 'spouse' })\nws.write({ type: 'del', key: 'occupation' })\nws.end()\n```\n\n#### db.createWriteStream({ type: 'del' })\n\nIf the *WriteStream* is created with a `'type'` option of `'del'`, all `write()` operations will be interpreted as `'del'`, unless explicitly specified as `'put'`.\n\n```js\nvar ws = db.createWriteStream({ type: 'del' })\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ key: 'name' })\nws.write({ key: 'dob' })\n// but it can be overridden\nws.write({ type: 'put', key: 'spouse', value: 'Ri Sol-ju' })\nws.write({ key: 'occupation' })\nws.end()\n```\n\n#### Pipes and Node Stream compatibility\n\nA ReadStream can be piped directly to a WriteStream, allowing for easy copying of an entire database. A simple `copy()` operation is included in LevelUP that performs exactly this on two open databases:\n\n```js\nfunction copy (srcdb, dstdb, callback) {\n  srcdb.createReadStream().pipe(dstdb.createWriteStream()).on('close', callback)\n}\n```\n\nThe ReadStream is also [fstream](https://github.com/isaacs/fstream)-compatible which means you should be able to pipe to and from fstreams. So you can serialize and deserialize an entire database to a directory where keys are filenames and values are their contents, or even into a *tar* file using [node-tar](https://github.com/isaacs/node-tar). See the [fstream functional test](https://github.com/rvagg/node-levelup/blob/master/test/functional/fstream-test.js) for an example. *(Note: I'm not really sure there's a great use-case for this but it's a fun example and it helps to harden the stream implementations.)*\n\nKeyStreams and ValueStreams can be treated like standard streams of raw data. If `'keyEncoding'` or `'valueEncoding'` is set to `'binary'` the `'data'` events will simply be standard Node `Buffer` objects straight out of the data store.\n\n\n--------------------------------------------------------\n<a name='approximateSize'></a>\n### db.db.approximateSize(start, end, callback)\n<code>approximateSize()</code> can used to get the approximate number of bytes of file system space used by the range `[start..end)`. The result may not include recently written data.\n\n```js\nvar db = require('level')('./huge.db')\n\ndb.db.approximateSize('a', 'c', function (err, size) {\n  if (err) return console.error('Ooops!', err)\n  console.log('Approximate size of range is %d', size)\n})\n```\n\n**Note:** `approximateSize()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/), which by default is accessible as the `db` property of your LevelUP instance. This is a specific LevelDB operation and is not likely to be available where you replace LevelDOWN with an alternative back-end via the `'db'` option.\n\n\n--------------------------------------------------------\n<a name='getProperty'></a>\n### db.db.getProperty(property)\n<code>getProperty</code> can be used to get internal details from LevelDB. When issued with a valid property string, a readable string will be returned (this method is synchronous).\n\nCurrently, the only valid properties are:\n\n* <b><code>'leveldb.num-files-at-levelN'</code></b>: returns the number of files at level *N*, where N is an integer representing a valid level (e.g. \"0\").\n\n* <b><code>'leveldb.stats'</code></b>: returns a multi-line string describing statistics about LevelDB's internal operation.\n\n* <b><code>'leveldb.sstables'</code></b>: returns a multi-line string describing all of the *sstables* that make up contents of the current database.\n\n\n```js\nvar db = require('level')('./huge.db')\nconsole.log(db.db.getProperty('leveldb.num-files-at-level3'))\n// → '243'\n```\n\n**Note:** `getProperty()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/), which by default is accessible as the `db` property of your LevelUP instance. This is a specific LevelDB operation and is not likely to be available where you replace LevelDOWN with an alternative back-end via the `'db'` option.\n\n\n--------------------------------------------------------\n<a name=\"destroy\"></a>\n### leveldown.destroy(location, callback)\n<code>destroy()</code> is used to completely remove an existing LevelDB database directory. You can use this function in place of a full directory *rm* if you want to be sure to only remove LevelDB-related files. If the directory only contains LevelDB files, the directory itself will be removed as well. If there are additional, non-LevelDB files in the directory, those files, and the directory, will be left alone.\n\nThe callback will be called when the destroy operation is complete, with a possible `error` argument.\n\n**Note:** `destroy()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/) which you will have to have available to `require()`, e.g.:\n\n```js\nrequire('leveldown').destroy('./huge.db', function () { console.log('done!') })\n```\n\n--------------------------------------------------------\n<a name=\"repair\"></a>\n### leveldown.repair(location, callback)\n<code>repair()</code> can be used to attempt a restoration of a damaged LevelDB store. From the LevelDB documentation:\n\n> If a DB cannot be opened, you may attempt to call this method to resurrect as much of the contents of the database as possible. Some data may be lost, so be careful when calling this function on a database that contains important information.\n\nYou will find information on the *repair* operation in the *LOG* file inside the store directory. \n\nA `repair()` can also be used to perform a compaction of the LevelDB log into table files.\n\nThe callback will be called when the repair operation is complete, with a possible `error` argument.\n\n**Note:** `destroy()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/) which you will have to have available to `require()`, e.g.:\n\n```js\nrequire('leveldown').repair('./huge.db', function () { console.log('done!') })\n```\n\n--------------------------------------------------------\n\n<a name=\"events\"></a>\nEvents\n------\n\nLevelUP emits events when the callbacks to the corresponding methods are called.\n\n* `db.emit('put', key, value)` emitted when a new value is `'put'`\n* `db.emit('del', key)` emitted when a value is deleted\n* `db.emit('batch', ary)` emitted when a batch operation has executed\n* `db.emit('ready')` emitted when the database has opened (`'open'` is synonym)\n* `db.emit('closed')` emitted when the database has closed\n* `db.emit('opening')` emitted when the database is opening\n* `db.emit('closing')` emitted when the database is closing\n\nIf you do not pass a callback to an async function, and there is an error, LevelUP will `emit('error', err)` instead.\n\n<a name=\"json\"></a>\nJSON data\n---------\n\nYou specify `'json'` encoding for both keys and/or values, you can then supply JavaScript objects to LevelUP and receive them from all fetch operations, including ReadStreams. LevelUP will automatically *stringify* your objects and store them as *utf8* and parse the strings back into objects before passing them back to you.\n\n<a name=\"custom_encodings\"></a>\nCustom encodings\n----------------\n\nA custom encoding may be provided by passing in an object as an value for `keyEncoding` or `valueEncoding` (wherever accepted), it must have the following properties:\n\n```js\n{\n    encode : function (val) { ... }\n  , decode : function (val) { ... }\n  , buffer : boolean // encode returns a buffer-like and decode accepts a buffer\n  , type   : String  // name of this encoding type.\n}\n```\n\n*\"buffer-like\"* means either a `Buffer` if running in Node, or a Uint8Array if in a browser. Use [bops](https://github.com/chrisdickinson/bops) to get portable binary operations.\n\n<a name=\"extending\"></a>\nExtending LevelUP\n-----------------\n\nA list of <a href=\"https://github.com/rvagg/node-levelup/wiki/Modules\"><b>Node.js LevelDB modules and projects</b></a> can be found in the wiki.\n\nWhen attempting to extend the functionality of LevelUP, it is recommended that you consider using [level-hooks](https://github.com/dominictarr/level-hooks) and/or [level-sublevel](https://github.com/dominictarr/level-sublevel). **level-sublevel** is particularly helpful for keeping additional, extension-specific, data in a LevelDB store. It allows you to partition a LevelUP instance into multiple sub-instances that each correspond to discrete namespaced key ranges.\n\n<a name=\"multiproc\"></a>\nMulti-process access\n--------------------\n\nLevelDB is thread-safe but is **not** suitable for accessing with multiple processes. You should only ever have a LevelDB database open from a single Node.js process. Node.js clusters are made up of multiple processes so a LevelUP instance cannot be shared between them either.\n\nSee the <a href=\"https://github.com/rvagg/node-levelup/wiki/Modules\"><b>wiki</b></a> for some LevelUP extensions, including [multilevel](https://github.com/juliangruber/multilevel), that may help if you require a single data store to be shared across processes.\n\n<a name=\"support\"></a>\nGetting support\n---------------\n\nThere are multiple ways you can find help in using LevelDB in Node.js:\n\n * **IRC:** you'll find an active group of LevelUP users in the **##leveldb** channel on Freenode, including most of the contributors to this project.\n * **Mailing list:** there is an active [Node.js LevelDB](https://groups.google.com/forum/#!forum/node-levelup) Google Group.\n * **GitHub:** you're welcome to open an issue here on this GitHub repository if you have a question.\n\n<a name=\"contributing\"></a>\nContributing\n------------\n\nLevelUP is an **OPEN Open Source Project**. This means that:\n\n> Individuals making significant and valuable contributions are given commit-access to the project to contribute as they see fit. This project is more like an open wiki than a standard guarded open source project.\n\nSee the [CONTRIBUTING.md](https://github.com/rvagg/node-levelup/blob/master/CONTRIBUTING.md) file for more details.\n\n### Contributors\n\nLevelUP is only possible due to the excellent work of the following contributors:\n\n<table><tbody>\n<tr><th align=\"left\">Rod Vagg</th><td><a href=\"https://github.com/rvagg\">GitHub/rvagg</a></td><td><a href=\"http://twitter.com/rvagg\">Twitter/@rvagg</a></td></tr>\n<tr><th align=\"left\">John Chesley</th><td><a href=\"https://github.com/chesles/\">GitHub/chesles</a></td><td><a href=\"http://twitter.com/chesles\">Twitter/@chesles</a></td></tr>\n<tr><th align=\"left\">Jake Verbaten</th><td><a href=\"https://github.com/raynos\">GitHub/raynos</a></td><td><a href=\"http://twitter.com/raynos2\">Twitter/@raynos2</a></td></tr>\n<tr><th align=\"left\">Dominic Tarr</th><td><a href=\"https://github.com/dominictarr\">GitHub/dominictarr</a></td><td><a href=\"http://twitter.com/dominictarr\">Twitter/@dominictarr</a></td></tr>\n<tr><th align=\"left\">Max Ogden</th><td><a href=\"https://github.com/maxogden\">GitHub/maxogden</a></td><td><a href=\"http://twitter.com/maxogden\">Twitter/@maxogden</a></td></tr>\n<tr><th align=\"left\">Lars-Magnus Skog</th><td><a href=\"https://github.com/ralphtheninja\">GitHub/ralphtheninja</a></td><td><a href=\"http://twitter.com/ralphtheninja\">Twitter/@ralphtheninja</a></td></tr>\n<tr><th align=\"left\">David Björklund</th><td><a href=\"https://github.com/kesla\">GitHub/kesla</a></td><td><a href=\"http://twitter.com/david_bjorklund\">Twitter/@david_bjorklund</a></td></tr>\n<tr><th align=\"left\">Julian Gruber</th><td><a href=\"https://github.com/juliangruber\">GitHub/juliangruber</a></td><td><a href=\"http://twitter.com/juliangruber\">Twitter/@juliangruber</a></td></tr>\n<tr><th align=\"left\">Paolo Fragomeni</th><td><a href=\"https://github.com/hij1nx\">GitHub/hij1nx</a></td><td><a href=\"http://twitter.com/hij1nx\">Twitter/@hij1nx</a></td></tr>\n<tr><th align=\"left\">Anton Whalley</th><td><a href=\"https://github.com/No9\">GitHub/No9</a></td><td><a href=\"https://twitter.com/antonwhalley\">Twitter/@antonwhalley</a></td></tr>\n<tr><th align=\"left\">Matteo Collina</th><td><a href=\"https://github.com/mcollina\">GitHub/mcollina</a></td><td><a href=\"https://twitter.com/matteocollina\">Twitter/@matteocollina</a></td></tr>\n<tr><th align=\"left\">Pedro Teixeira</th><td><a href=\"https://github.com/pgte\">GitHub/pgte</a></td><td><a href=\"https://twitter.com/pgte\">Twitter/@pgte</a></td></tr>\n<tr><th align=\"left\">James Halliday</th><td><a href=\"https://github.com/substack\">GitHub/substack</a></td><td><a href=\"https://twitter.com/substack\">Twitter/@substack</a></td></tr>\n</tbody></table>\n\n### Windows\n\nA large portion of the Windows support comes from code by [Krzysztof Kowalczyk](http://blog.kowalczyk.info/) [@kjk](https://twitter.com/kjk), see his Windows LevelDB port [here](http://code.google.com/r/kkowalczyk-leveldb/). If you're using LevelUP on Windows, you should give him your thanks!\n\n\n<a name=\"licence\"></a>\nLicence &amp; copyright\n-------------------\n\nCopyright (c) 2012-2013 LevelUP contributors (listed above).\n\nLevelUP is licensed under an MIT +no-false-attribs license. All rights not explicitly granted in the MIT license are reserved. See the included LICENSE file for more details.\n\n=======\n*LevelUP builds on the excellent work of the LevelDB and Snappy teams from Google and additional contributors. LevelDB and Snappy are both issued under the [New BSD Licence](http://opensource.org/licenses/BSD-3-Clause).*\n",
+  "readme": "LevelUP\n=======\n\n![LevelDB Logo](https://0.gravatar.com/avatar/a498b122aecb7678490a38bb593cc12d)\n\n**Fast & simple storage - a Node.js-style LevelDB wrapper**\n\n[![Build Status](https://secure.travis-ci.org/rvagg/node-levelup.png)](http://travis-ci.org/rvagg/node-levelup)\n\n[![NPM](https://nodei.co/npm/levelup.png?stars&downloads)](https://nodei.co/npm/levelup/) [![NPM](https://nodei.co/npm-dl/levelup.png)](https://nodei.co/npm/levelup/)\n\n\n  * <a href=\"#intro\">Introduction</a>\n  * <a href=\"#leveldown\">Relationship to LevelDOWN</a>\n  * <a href=\"#platforms\">Tested &amp; supported platforms</a>\n  * <a href=\"#basic\">Basic usage</a>\n  * <a href=\"#api\">API</a>\n  * <a href=\"#events\">Events</a>\n  * <a href=\"#json\">JSON data</a>\n  * <a href=\"#custom_encodings\">Custom encodings</a>\n  * <a href=\"#extending\">Extending LevelUP</a>\n  * <a href=\"#multiproc\">Multi-process access</a>\n  * <a href=\"#support\">Getting support</a>\n  * <a href=\"#contributing\">Contributing</a>\n  * <a href=\"#licence\">Licence &amp; copyright</a>\n\n<a name=\"intro\"></a>\nIntroduction\n------------\n\n**[LevelDB](http://code.google.com/p/leveldb/)** is a simple key/value data store built by Google, inspired by BigTable. It's used in Google Chrome and many other products. LevelDB supports arbitrary byte arrays as both keys and values, singular *get*, *put* and *delete* operations, *batched put and delete*, bi-directional iterators and simple compression using the very fast [Snappy](http://code.google.com/p/snappy/) algorithm.\n\n**LevelUP** aims to expose the features of LevelDB in a **Node.js-friendly way**. All standard `Buffer` encoding types are supported, as is a special JSON encoding. LevelDB's iterators are exposed as a Node.js-style **readable stream** a matching **writeable stream** converts writes to *batch* operations.\n\nLevelDB stores entries **sorted lexicographically by keys**. This makes LevelUP's <a href=\"#createReadStream\"><code>ReadStream</code></a> interface a very powerful query mechanism.\n\n**LevelUP** is an **OPEN Open Source Project**, see the <a href=\"#contributing\">Contributing</a> section to find out what this means.\n\n<a name=\"leveldown\"></a>\nRelationship to LevelDOWN\n-------------------------\n\nLevelUP is designed to be backed by **[LevelDOWN](https://github.com/rvagg/node-leveldown/)** which provides a pure C++ binding to LevelDB and can be used as a stand-alone package if required.\n\n**As of version 0.9, LevelUP no longer requires LevelDOWN as a dependency so you must `npm install leveldown` when you install LevelUP.**\n\nLevelDOWN is now optional because LevelUP can be used with alternative backends, such as **[level.js](https://github.com/maxogden/level.js)** in the browser or [MemDOWN](https://github.com/rvagg/node-memdown) for a pure in-memory store.\n\nLevelUP will look for LevelDOWN and throw an error if it can't find it in its Node `require()` path. It will also tell you if the installed version of LevelDOWN is incompatible.\n\n**The [level](https://github.com/level/level) package is available as an alternative installation mechanism.** Install it instead to automatically get both LevelUP & LevelDOWN. It exposes LevelUP on its export (i.e. you can `var leveldb = require('level')`).\n\n\n<a name=\"platforms\"></a>\nTested & supported platforms\n----------------------------\n\n  * **Linux**: including ARM platforms such as Raspberry Pi *and Kindle!*\n  * **Mac OS**\n  * **Solaris**: including Joyent's SmartOS & Nodejitsu\n  * **Windows**: Node 0.10 and above only. See installation instructions for *node-gyp's* dependencies [here](https://github.com/TooTallNate/node-gyp#installation), you'll need these (free) components from Microsoft to compile and run any native Node add-on in Windows.\n\n<a name=\"basic\"></a>\nBasic usage\n-----------\n\nFirst you need to install LevelUP!\n\n```sh\n$ npm install levelup leveldown\n```\n\nOr\n\n```sh\n$ npm install level\n```\n\n*(this second option requires you to use LevelUP by calling `var levelup = require('level')`)*\n\n\nAll operations are asynchronous although they don't necessarily require a callback if you don't need to know when the operation was performed.\n\n```js\nvar levelup = require('levelup')\n\n// 1) Create our database, supply location and options.\n//    This will create or open the underlying LevelDB store.\nvar db = levelup('./mydb')\n\n// 2) put a key & value\ndb.put('name', 'LevelUP', function (err) {\n  if (err) return console.log('Ooops!', err) // some kind of I/O error\n\n  // 3) fetch by key\n  db.get('name', function (err, value) {\n    if (err) return console.log('Ooops!', err) // likely the key was not found\n\n    // ta da!\n    console.log('name=' + value)\n  })\n})\n```\n\n<a name=\"api\"></a>\n## API\n\n  * <a href=\"#ctor\"><code><b>levelup()</b></code></a>\n  * <a href=\"#open\"><code>db.<b>open()</b></code></a>\n  * <a href=\"#close\"><code>db.<b>close()</b></code></a>\n  * <a href=\"#put\"><code>db.<b>put()</b></code></a>\n  * <a href=\"#get\"><code>db.<b>get()</b></code></a>\n  * <a href=\"#del\"><code>db.<b>del()</b></code></a>\n  * <a href=\"#batch\"><code>db.<b>batch()</b></code> *(array form)*</a>\n  * <a href=\"#batch_chained\"><code>db.<b>batch()</b></code> *(chained form)*</a>\n  * <a href=\"#isOpen\"><code>db.<b>isOpen()</b></code></a>\n  * <a href=\"#isClosed\"><code>db.<b>isClosed()</b></code></a>\n  * <a href=\"#createReadStream\"><code>db.<b>createReadStream()</b></code></a>\n  * <a href=\"#createKeyStream\"><code>db.<b>createKeyStream()</b></code></a>\n  * <a href=\"#createValueStream\"><code>db.<b>createValueStream()</b></code></a>\n  * <a href=\"#createWriteStream\"><code>db.<b>createWriteStream()</b></code></a>\n\n### Special operations exposed by LevelDOWN\n\n  * <a href=\"#approximateSize\"><code>db.db.<b>approximateSize()</b></code></a>\n  * <a href=\"#getProperty\"><code>db.db.<b>getProperty()</b></code></a>\n  * <a href=\"#destroy\"><code><b>leveldown.destroy()</b></code></a>\n  * <a href=\"#repair\"><code><b>leveldown.repair()</b></code></a>\n\n\n--------------------------------------------------------\n<a name=\"ctor\"></a>\n### levelup(location[, options[, callback]])\n### levelup(options[, callback ])\n### levelup(db[, callback ])\n<code>levelup()</code> is the main entry point for creating a new LevelUP instance and opening the underlying store with LevelDB.\n\nThis function returns a new instance of LevelUP and will also initiate an <a href=\"#open\"><code>open()</code></a> operation. Opening the database is an asynchronous operation which will trigger your callback if you provide one. The callback should take the form: `function (err, db) {}` where the `db` is the LevelUP instance. If you don't provide a callback, any read & write operations are simply queued internally until the database is fully opened.\n\nThis leads to two alternative ways of managing a new LevelUP instance:\n\n```js\nlevelup(location, options, function (err, db) {\n  if (err) throw err\n  db.get('foo', function (err, value) {\n    if (err) return console.log('foo does not exist')\n    console.log('got foo =', value)\n  })\n})\n\n// vs the equivalent:\n\nvar db = levelup(location, options) // will throw if an error occurs\ndb.get('foo', function (err, value) {\n  if (err) return console.log('foo does not exist')\n  console.log('got foo =', value)\n})\n```\n\nThe `location` argument is available as a read-only property on the returned LevelUP instance.\n\nThe `levelup(options, callback)` form (with optional `callback`) is only available where you provide a valid `'db'` property on the options object (see below). Only for back-ends that don't require a `location` argument, such as [MemDOWN](https://github.com/rvagg/memdown).\n\nFor example:\n\n```js\nvar levelup = require('levelup')\nvar memdown = require('memdown')\nvar db = levelup({ db: memdown })\n```\n\nThe `levelup(db, callback)` form (with optional `callback`) is only available where `db` is a factory function, as would be provided as a `'db'` property on an `options` object (see below). Only for back-ends that don't require a `location` argument, such as [MemDOWN](https://github.com/rvagg/memdown).\n\nFor example:\n\n```js\nvar levelup = require('levelup')\nvar memdown = require('memdown')\nvar db = levelup(memdown)\n```\n\n#### `options`\n\n`levelup()` takes an optional options object as its second argument; the following properties are accepted:\n\n* `'createIfMissing'` *(boolean, default: `true`)*: If `true`, will initialise an empty database at the specified location if one doesn't already exist. If `false` and a database doesn't exist you will receive an error in your `open()` callback and your database won't open.\n\n* `'errorIfExists'` *(boolean, default: `false`)*: If `true`, you will receive an error in your `open()` callback if the database exists at the specified location.\n\n* `'compression'` *(boolean, default: `true`)*: If `true`, all *compressible* data will be run through the Snappy compression algorithm before being stored. Snappy is very fast and shouldn't gain much speed by disabling so leave this on unless you have good reason to turn it off.\n\n* `'cacheSize'` *(number, default: `8 * 1024 * 1024`)*: The size (in bytes) of the in-memory [LRU](http://en.wikipedia.org/wiki/Cache_algorithms#Least_Recently_Used) cache with frequently used uncompressed block contents. \n\n* `'keyEncoding'` and `'valueEncoding'` *(string, default: `'utf8'`)*: The encoding of the keys and values passed through Node.js' `Buffer` implementation (see [Buffer#toString()](http://nodejs.org/docs/latest/api/buffer.html#buffer_buf_tostring_encoding_start_end)).\n  <p><code>'utf8'</code> is the default encoding for both keys and values so you can simply pass in strings and expect strings from your <code>get()</code> operations. You can also pass <code>Buffer</code> objects as keys and/or values and conversion will be performed.</p>\n  <p>Supported encodings are: hex, utf8, ascii, binary, base64, ucs2, utf16le.</p>\n  <p><code>'json'</code> encoding is also supported, see below.</p>\n\n* `'db'` *(object, default: LevelDOWN)*: LevelUP is backed by [LevelDOWN](https://github.com/rvagg/node-leveldown/) to provide an interface to LevelDB. You can completely replace the use of LevelDOWN by providing a \"factory\" function that will return a LevelDOWN API compatible object given a `location` argument. For further information, see [MemDOWN](https://github.com/rvagg/node-memdown/), a fully LevelDOWN API compatible replacement that uses a memory store rather than LevelDB. Also see [Abstract LevelDOWN](http://github.com/rvagg/node-abstract-leveldown), a partial implementation of the LevelDOWN API that can be used as a base prototype for a LevelDOWN substitute.\n\nAdditionally, each of the main interface methods accept an optional options object that can be used to override `'keyEncoding'` and `'valueEncoding'`.\n\n--------------------------------------------------------\n<a name=\"open\"></a>\n### db.open([callback])\n<code>open()</code> opens the underlying LevelDB store. In general **you should never need to call this method directly** as it's automatically called by <a href=\"#ctor\"><code>levelup()</code></a>.\n\nHowever, it is possible to *reopen* a database after it has been closed with <a href=\"#close\"><code>close()</code></a>, although this is not generally advised.\n\n--------------------------------------------------------\n<a name=\"close\"></a>\n### db.close([callback])\n<code>close()</code> closes the underlying LevelDB store. The callback will receive any error encountered during closing as the first argument.\n\nYou should always clean up your LevelUP instance by calling `close()` when you no longer need it to free up resources. A LevelDB store cannot be opened by multiple instances of LevelDB/LevelUP simultaneously.\n\n--------------------------------------------------------\n<a name=\"put\"></a>\n### db.put(key, value[, options][, callback])\n<code>put()</code> is the primary method for inserting data into the store. Both the `key` and `value` can be arbitrary data objects.\n\nThe callback argument is optional but if you don't provide one and an error occurs then expect the error to be thrown.\n\n#### `options`\n\nEncoding of the `key` and `value` objects will adhere to `'keyEncoding'` and `'valueEncoding'` options provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `put()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nIf you provide a `'sync'` value of `true` in your `options` object, LevelDB will perform a synchronous write of the data; although the operation will be asynchronous as far as Node is concerned. Normally, LevelDB passes the data to the operating system for writing and returns immediately, however a synchronous write will use `fsync()` or equivalent so your callback won't be triggered until the data is actually on disk. Synchronous filesystem writes are **significantly** slower than asynchronous writes but if you want to be absolutely sure that the data is flushed then you can use `'sync': true`.\n\n--------------------------------------------------------\n<a name=\"get\"></a>\n### db.get(key[, options][, callback])\n<code>get()</code> is the primary method for fetching data from the store. The `key` can be an arbitrary data object. If it doesn't exist in the store then the callback will receive an error as its first argument. A not-found err object will be of type `'NotFoundError'` so you can `err.type == 'NotFoundError'` or you can perform a truthy test on the property `err.notFound`.\n\n```js\ndb.get('foo', function (err, value) {\n  if (err) {\n    if (err.notFound) {\n      // handle a 'NotFoundError' here\n      return\n    }\n    // I/O or other error, pass it up the callback chain\n    return callback(err)\n  }\n\n  // .. handle `value` here\n})\n```\n\n#### `options`\n\nEncoding of the `key` object will adhere to the `'keyEncoding'` option provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `get()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nLevelDB will by default fill the in-memory LRU Cache with data from a call to get. Disabling this is done by setting `fillCache` to `false`. \n\n--------------------------------------------------------\n<a name=\"del\"></a>\n### db.del(key[, options][, callback])\n<code>del()</code> is the primary method for removing data from the store.\n\n#### `options`\n\nEncoding of the `key` object will adhere to the `'keyEncoding'` option provided to <a href=\"#ctor\"><code>levelup()</code></a>, although you can provide alternative encoding settings in the options for `del()` (it's recommended that you stay consistent in your encoding of keys and values in a single store).\n\nA `'sync'` option can also be passed, see <a href=\"#put\"><code>put()</code></a> for details on how this works.\n\n--------------------------------------------------------\n<a name=\"batch\"></a>\n### db.batch(array[, options][, callback]) *(array form)*\n<code>batch()</code> can be used for very fast bulk-write operations (both *put* and *delete*). The `array` argument should contain a list of operations to be executed sequentially, although as a whole they are performed as an atomic operation inside LevelDB. Each operation is contained in an object having the following properties: `type`, `key`, `value`, where the *type* is either `'put'` or `'del'`. In the case of `'del'` the `'value'` property is ignored. Any entries with a `'key'` of `null` or `undefined` will cause an error to be returned on the `callback` and any `'type': 'put'` entry with a `'value'` of `null` or `undefined` will return an error.\n\n```js\nvar ops = [\n    { type: 'del', key: 'father' }\n  , { type: 'put', key: 'name', value: 'Yuri Irsenovich Kim' }\n  , { type: 'put', key: 'dob', value: '16 February 1941' }\n  , { type: 'put', key: 'spouse', value: 'Kim Young-sook' }\n  , { type: 'put', key: 'occupation', value: 'Clown' }\n]\n\ndb.batch(ops, function (err) {\n  if (err) return console.log('Ooops!', err)\n  console.log('Great success dear leader!')\n})\n```\n\n#### `options`\n\nSee <a href=\"#put\"><code>put()</code></a> for a discussion on the `options` object. You can overwrite default `'keyEncoding'` and `'valueEncoding'` and also specify the use of `sync` filesystem operations.\n\nIn addition to encoding options for the whole batch you can also overwrite the encoding per operation, like:\n\n```js\nvar ops = [{\n    type          : 'put'\n  , key           : new Buffer([1, 2, 3])\n  , value         : { some: 'json' }\n  , keyEncoding   : 'binary'\n  , valueEncoding : 'json'\n}]\n```\n\n--------------------------------------------------------\n<a name=\"batch_chained\"></a>\n### db.batch() *(chained form)*\n<code>batch()</code>, when called with no arguments will return a `Batch` object which can be used to build, and eventually commit, an atomic LevelDB batch operation. Depending on how it's used, it is possible to obtain greater performance when using the chained form of `batch()` over the array form.\n\n```js\ndb.batch()\n  .del('father')\n  .put('name', 'Yuri Irsenovich Kim')\n  .put('dob', '16 February 1941')\n  .put('spouse', 'Kim Young-sook')\n  .put('occupation', 'Clown')\n  .write(function () { console.log('Done!') })\n```\n\n<b><code>batch.put(key, value[, options])</code></b>\n\nQueue a *put* operation on the current batch, not committed until a `write()` is called on the batch.\n\nThe optional `options` argument can be used to override the default `'keyEncoding'` and/or `'valueEncoding'`.\n\nThis method may `throw` a `WriteError` if there is a problem with your put (such as the `value` being `null` or `undefined`).\n\n<b><code>batch.del(key[, options])</code></b>\n\nQueue a *del* operation on the current batch, not committed until a `write()` is called on the batch.\n\nThe optional `options` argument can be used to override the default `'keyEncoding'`.\n\nThis method may `throw` a `WriteError` if there is a problem with your delete.\n\n<b><code>batch.clear()</code></b>\n\nClear all queued operations on the current batch, any previous operations will be discarded.\n\n<b><code>batch.write([callback])</code></b>\n\nCommit the queued operations for this batch. All operations not *cleared* will be written to the database atomically, that is, they will either all succeed or fail with no partial commits. The optional `callback` will be called when the operation has completed with an *error* argument if an error has occurred; if no `callback` is supplied and an error occurs then this method will `throw` a `WriteError`.\n\n\n--------------------------------------------------------\n<a name=\"isOpen\"></a>\n### db.isOpen()\n\nA LevelUP object can be in one of the following states:\n\n  * *\"new\"*     - newly created, not opened or closed\n  * *\"opening\"* - waiting for the database to be opened\n  * *\"open\"*    - successfully opened the database, available for use\n  * *\"closing\"* - waiting for the database to be closed\n  * *\"closed\"*  - database has been successfully closed, should not be used\n\n`isOpen()` will return `true` only when the state is \"open\".\n\n--------------------------------------------------------\n<a name=\"isClosed\"></a>\n### db.isClosed()\n\n*See <a href=\"#put\"><code>isOpen()</code></a>*\n\n`isClosed()` will return `true` only when the state is \"closing\" *or* \"closed\", it can be useful for determining if read and write operations are permissible.\n\n--------------------------------------------------------\n<a name=\"createReadStream\"></a>\n### db.createReadStream([options])\n\nYou can obtain a **ReadStream** of the full database by calling the `createReadStream()` method. The resulting stream is a complete Node.js-style [Readable Stream](http://nodejs.org/docs/latest/api/stream.html#stream_readable_stream) where `'data'` events emit objects with `'key'` and `'value'` pairs. You can also use the `start`, `end` and `limit` options to control the range of keys that are streamed.\n\n```js\ndb.createReadStream()\n  .on('data', function (data) {\n    console.log(data.key, '=', data.value)\n  })\n  .on('error', function (err) {\n    console.log('Oh my!', err)\n  })\n  .on('close', function () {\n    console.log('Stream closed')\n  })\n  .on('end', function () {\n    console.log('Stream closed')\n  })\n```\n\nThe standard `pause()`, `resume()` and `destroy()` methods are implemented on the ReadStream, as is `pipe()` (see below). `'data'`, '`error'`, `'end'` and `'close'` events are emitted.\n\nAdditionally, you can supply an options object as the first parameter to `createReadStream()` with the following options:\n\n* `'start'`: the key you wish to start the read at. By default it will start at the beginning of the store. Note that the *start* doesn't have to be an actual key that exists, LevelDB will simply find the *next* key, greater than the key you provide.\n\n* `'end'`: the key you wish to end the read on. By default it will continue until the end of the store. Again, the *end* doesn't have to be an actual key as an (inclusive) `<=`-type operation is performed to detect the end. You can also use the `destroy()` method instead of supplying an `'end'` parameter to achieve the same effect.\n\n* `'reverse'` *(boolean, default: `false`)*: a boolean, set to true if you want the stream to go in reverse order. Beware that due to the way LevelDB works, a reverse seek will be slower than a forward seek.\n\n* `'keys'` *(boolean, default: `true`)*: whether the `'data'` event should contain keys. If set to `true` and `'values'` set to `false` then `'data'` events will simply be keys, rather than objects with a `'key'` property. Used internally by the `createKeyStream()` method.\n\n* `'values'` *(boolean, default: `true`)*: whether the `'data'` event should contain values. If set to `true` and `'keys'` set to `false` then `'data'` events will simply be values, rather than objects with a `'value'` property. Used internally by the `createValueStream()` method.\n\n* `'limit'` *(number, default: `-1`)*: limit the number of results collected by this stream. This number represents a *maximum* number of results and may not be reached if you get to the end of the store or your `'end'` value first. A value of `-1` means there is no limit.\n\n* `'fillCache'` *(boolean, default: `false`)*: wheather LevelDB's LRU-cache should be filled with data read.\n\n* `'keyEncoding'` / `'valueEncoding'` *(string)*: the encoding applied to each read piece of data.\n\n--------------------------------------------------------\n<a name=\"createKeyStream\"></a>\n### db.createKeyStream([options])\n\nA **KeyStream** is a **ReadStream** where the `'data'` events are simply the keys from the database so it can be used like a traditional stream rather than an object stream.\n\nYou can obtain a KeyStream either by calling the `createKeyStream()` method on a LevelUP object or by passing passing an options object to `createReadStream()` with `keys` set to `true` and `values` set to `false`.\n\n```js\ndb.createKeyStream()\n  .on('data', function (data) {\n    console.log('key=', data)\n  })\n\n// same as:\ndb.createReadStream({ keys: true, values: false })\n  .on('data', function (data) {\n    console.log('key=', data)\n  })\n```\n\n--------------------------------------------------------\n<a name=\"createValueStream\"></a>\n### db.createValueStream([options])\n\nA **ValueStream** is a **ReadStream** where the `'data'` events are simply the values from the database so it can be used like a traditional stream rather than an object stream.\n\nYou can obtain a ValueStream either by calling the `createValueStream()` method on a LevelUP object or by passing passing an options object to `createReadStream()` with `values` set to `true` and `keys` set to `false`.\n\n```js\ndb.createValueStream()\n  .on('data', function (data) {\n    console.log('value=', data)\n  })\n\n// same as:\ndb.createReadStream({ keys: false, values: true })\n  .on('data', function (data) {\n    console.log('value=', data)\n  })\n```\n\n--------------------------------------------------------\n<a name=\"createWriteStream\"></a>\n### db.createWriteStream([options])\n\nA **WriteStream** can be obtained by calling the `createWriteStream()` method. The resulting stream is a complete Node.js-style [Writable Stream](http://nodejs.org/docs/latest/api/stream.html#stream_writable_stream) which accepts objects with `'key'` and `'value'` pairs on its `write()` method.\n\nThe WriteStream will buffer writes and submit them as a `batch()` operations where writes occur *within the same tick*.\n\n```js\nvar ws = db.createWriteStream()\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ key: 'name', value: 'Yuri Irsenovich Kim' })\nws.write({ key: 'dob', value: '16 February 1941' })\nws.write({ key: 'spouse', value: 'Kim Young-sook' })\nws.write({ key: 'occupation', value: 'Clown' })\nws.end()\n```\n\nThe standard `write()`, `end()`, `destroy()` and `destroySoon()` methods are implemented on the WriteStream. `'drain'`, `'error'`, `'close'` and `'pipe'` events are emitted.\n\nYou can specify encodings both for the whole stream and individual entries:\n\nTo set the encoding for the whole stream, provide an options object as the first parameter to `createWriteStream()` with `'keyEncoding'` and/or `'valueEncoding'`.\n\nTo set the encoding for an individual entry:\n\n```js\nwriteStream.write({\n    key           : new Buffer([1, 2, 3])\n  , value         : { some: 'json' }\n  , keyEncoding   : 'binary'\n  , valueEncoding : 'json'\n})\n```\n\n#### write({ type: 'put' })\n\nIf individual `write()` operations are performed with a `'type'` property of `'del'`, they will be passed on as `'del'` operations to the batch.\n\n```js\nvar ws = db.createWriteStream()\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ type: 'del', key: 'name' })\nws.write({ type: 'del', key: 'dob' })\nws.write({ type: 'put', key: 'spouse' })\nws.write({ type: 'del', key: 'occupation' })\nws.end()\n```\n\n#### db.createWriteStream({ type: 'del' })\n\nIf the *WriteStream* is created with a `'type'` option of `'del'`, all `write()` operations will be interpreted as `'del'`, unless explicitly specified as `'put'`.\n\n```js\nvar ws = db.createWriteStream({ type: 'del' })\n\nws.on('error', function (err) {\n  console.log('Oh my!', err)\n})\nws.on('close', function () {\n  console.log('Stream closed')\n})\n\nws.write({ key: 'name' })\nws.write({ key: 'dob' })\n// but it can be overridden\nws.write({ type: 'put', key: 'spouse', value: 'Ri Sol-ju' })\nws.write({ key: 'occupation' })\nws.end()\n```\n\n#### Pipes and Node Stream compatibility\n\nA ReadStream can be piped directly to a WriteStream, allowing for easy copying of an entire database. A simple `copy()` operation is included in LevelUP that performs exactly this on two open databases:\n\n```js\nfunction copy (srcdb, dstdb, callback) {\n  srcdb.createReadStream().pipe(dstdb.createWriteStream()).on('close', callback)\n}\n```\n\nThe ReadStream is also [fstream](https://github.com/isaacs/fstream)-compatible which means you should be able to pipe to and from fstreams. So you can serialize and deserialize an entire database to a directory where keys are filenames and values are their contents, or even into a *tar* file using [node-tar](https://github.com/isaacs/node-tar). See the [fstream functional test](https://github.com/rvagg/node-levelup/blob/master/test/functional/fstream-test.js) for an example. *(Note: I'm not really sure there's a great use-case for this but it's a fun example and it helps to harden the stream implementations.)*\n\nKeyStreams and ValueStreams can be treated like standard streams of raw data. If `'keyEncoding'` or `'valueEncoding'` is set to `'binary'` the `'data'` events will simply be standard Node `Buffer` objects straight out of the data store.\n\n\n--------------------------------------------------------\n<a name='approximateSize'></a>\n### db.db.approximateSize(start, end, callback)\n<code>approximateSize()</code> can used to get the approximate number of bytes of file system space used by the range `[start..end)`. The result may not include recently written data.\n\n```js\nvar db = require('level')('./huge.db')\n\ndb.db.approximateSize('a', 'c', function (err, size) {\n  if (err) return console.error('Ooops!', err)\n  console.log('Approximate size of range is %d', size)\n})\n```\n\n**Note:** `approximateSize()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/), which by default is accessible as the `db` property of your LevelUP instance. This is a specific LevelDB operation and is not likely to be available where you replace LevelDOWN with an alternative back-end via the `'db'` option.\n\n\n--------------------------------------------------------\n<a name='getProperty'></a>\n### db.db.getProperty(property)\n<code>getProperty</code> can be used to get internal details from LevelDB. When issued with a valid property string, a readable string will be returned (this method is synchronous).\n\nCurrently, the only valid properties are:\n\n* <b><code>'leveldb.num-files-at-levelN'</code></b>: returns the number of files at level *N*, where N is an integer representing a valid level (e.g. \"0\").\n\n* <b><code>'leveldb.stats'</code></b>: returns a multi-line string describing statistics about LevelDB's internal operation.\n\n* <b><code>'leveldb.sstables'</code></b>: returns a multi-line string describing all of the *sstables* that make up contents of the current database.\n\n\n```js\nvar db = require('level')('./huge.db')\nconsole.log(db.db.getProperty('leveldb.num-files-at-level3'))\n// → '243'\n```\n\n**Note:** `getProperty()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/), which by default is accessible as the `db` property of your LevelUP instance. This is a specific LevelDB operation and is not likely to be available where you replace LevelDOWN with an alternative back-end via the `'db'` option.\n\n\n--------------------------------------------------------\n<a name=\"destroy\"></a>\n### leveldown.destroy(location, callback)\n<code>destroy()</code> is used to completely remove an existing LevelDB database directory. You can use this function in place of a full directory *rm* if you want to be sure to only remove LevelDB-related files. If the directory only contains LevelDB files, the directory itself will be removed as well. If there are additional, non-LevelDB files in the directory, those files, and the directory, will be left alone.\n\nThe callback will be called when the destroy operation is complete, with a possible `error` argument.\n\n**Note:** `destroy()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/) which you will have to install seperately, e.g.:\n\n```js\nrequire('leveldown').destroy('./huge.db', function (err) { console.log('done!') })\n```\n\n--------------------------------------------------------\n<a name=\"repair\"></a>\n### leveldown.repair(location, callback)\n<code>repair()</code> can be used to attempt a restoration of a damaged LevelDB store. From the LevelDB documentation:\n\n> If a DB cannot be opened, you may attempt to call this method to resurrect as much of the contents of the database as possible. Some data may be lost, so be careful when calling this function on a database that contains important information.\n\nYou will find information on the *repair* operation in the *LOG* file inside the store directory. \n\nA `repair()` can also be used to perform a compaction of the LevelDB log into table files.\n\nThe callback will be called when the repair operation is complete, with a possible `error` argument.\n\n**Note:** `repair()` is available via [LevelDOWN](https://github.com/rvagg/node-leveldown/) which you will have to install seperately, e.g.:\n\n```js\nrequire('leveldown').repair('./huge.db', function (err) { console.log('done!') })\n```\n\n--------------------------------------------------------\n\n<a name=\"events\"></a>\nEvents\n------\n\nLevelUP emits events when the callbacks to the corresponding methods are called.\n\n* `db.emit('put', key, value)` emitted when a new value is `'put'`\n* `db.emit('del', key)` emitted when a value is deleted\n* `db.emit('batch', ary)` emitted when a batch operation has executed\n* `db.emit('ready')` emitted when the database has opened (`'open'` is synonym)\n* `db.emit('closed')` emitted when the database has closed\n* `db.emit('opening')` emitted when the database is opening\n* `db.emit('closing')` emitted when the database is closing\n\nIf you do not pass a callback to an async function, and there is an error, LevelUP will `emit('error', err)` instead.\n\n<a name=\"json\"></a>\nJSON data\n---------\n\nYou specify `'json'` encoding for both keys and/or values, you can then supply JavaScript objects to LevelUP and receive them from all fetch operations, including ReadStreams. LevelUP will automatically *stringify* your objects and store them as *utf8* and parse the strings back into objects before passing them back to you.\n\n<a name=\"custom_encodings\"></a>\nCustom encodings\n----------------\n\nA custom encoding may be provided by passing in an object as an value for `keyEncoding` or `valueEncoding` (wherever accepted), it must have the following properties:\n\n```js\n{\n    encode : function (val) { ... }\n  , decode : function (val) { ... }\n  , buffer : boolean // encode returns a buffer-like and decode accepts a buffer\n  , type   : String  // name of this encoding type.\n}\n```\n\n*\"buffer-like\"* means either a `Buffer` if running in Node, or a Uint8Array if in a browser. Use [bops](https://github.com/chrisdickinson/bops) to get portable binary operations.\n\n<a name=\"extending\"></a>\nExtending LevelUP\n-----------------\n\nA list of <a href=\"https://github.com/rvagg/node-levelup/wiki/Modules\"><b>Node.js LevelDB modules and projects</b></a> can be found in the wiki.\n\nWhen attempting to extend the functionality of LevelUP, it is recommended that you consider using [level-hooks](https://github.com/dominictarr/level-hooks) and/or [level-sublevel](https://github.com/dominictarr/level-sublevel). **level-sublevel** is particularly helpful for keeping additional, extension-specific, data in a LevelDB store. It allows you to partition a LevelUP instance into multiple sub-instances that each correspond to discrete namespaced key ranges.\n\n<a name=\"multiproc\"></a>\nMulti-process access\n--------------------\n\nLevelDB is thread-safe but is **not** suitable for accessing with multiple processes. You should only ever have a LevelDB database open from a single Node.js process. Node.js clusters are made up of multiple processes so a LevelUP instance cannot be shared between them either.\n\nSee the <a href=\"https://github.com/rvagg/node-levelup/wiki/Modules\"><b>wiki</b></a> for some LevelUP extensions, including [multilevel](https://github.com/juliangruber/multilevel), that may help if you require a single data store to be shared across processes.\n\n<a name=\"support\"></a>\nGetting support\n---------------\n\nThere are multiple ways you can find help in using LevelDB in Node.js:\n\n * **IRC:** you'll find an active group of LevelUP users in the **##leveldb** channel on Freenode, including most of the contributors to this project.\n * **Mailing list:** there is an active [Node.js LevelDB](https://groups.google.com/forum/#!forum/node-levelup) Google Group.\n * **GitHub:** you're welcome to open an issue here on this GitHub repository if you have a question.\n\n<a name=\"contributing\"></a>\nContributing\n------------\n\nLevelUP is an **OPEN Open Source Project**. This means that:\n\n> Individuals making significant and valuable contributions are given commit-access to the project to contribute as they see fit. This project is more like an open wiki than a standard guarded open source project.\n\nSee the [CONTRIBUTING.md](https://github.com/rvagg/node-levelup/blob/master/CONTRIBUTING.md) file for more details.\n\n### Contributors\n\nLevelUP is only possible due to the excellent work of the following contributors:\n\n<table><tbody>\n<tr><th align=\"left\">Rod Vagg</th><td><a href=\"https://github.com/rvagg\">GitHub/rvagg</a></td><td><a href=\"http://twitter.com/rvagg\">Twitter/@rvagg</a></td></tr>\n<tr><th align=\"left\">John Chesley</th><td><a href=\"https://github.com/chesles/\">GitHub/chesles</a></td><td><a href=\"http://twitter.com/chesles\">Twitter/@chesles</a></td></tr>\n<tr><th align=\"left\">Jake Verbaten</th><td><a href=\"https://github.com/raynos\">GitHub/raynos</a></td><td><a href=\"http://twitter.com/raynos2\">Twitter/@raynos2</a></td></tr>\n<tr><th align=\"left\">Dominic Tarr</th><td><a href=\"https://github.com/dominictarr\">GitHub/dominictarr</a></td><td><a href=\"http://twitter.com/dominictarr\">Twitter/@dominictarr</a></td></tr>\n<tr><th align=\"left\">Max Ogden</th><td><a href=\"https://github.com/maxogden\">GitHub/maxogden</a></td><td><a href=\"http://twitter.com/maxogden\">Twitter/@maxogden</a></td></tr>\n<tr><th align=\"left\">Lars-Magnus Skog</th><td><a href=\"https://github.com/ralphtheninja\">GitHub/ralphtheninja</a></td><td><a href=\"http://twitter.com/ralphtheninja\">Twitter/@ralphtheninja</a></td></tr>\n<tr><th align=\"left\">David Björklund</th><td><a href=\"https://github.com/kesla\">GitHub/kesla</a></td><td><a href=\"http://twitter.com/david_bjorklund\">Twitter/@david_bjorklund</a></td></tr>\n<tr><th align=\"left\">Julian Gruber</th><td><a href=\"https://github.com/juliangruber\">GitHub/juliangruber</a></td><td><a href=\"http://twitter.com/juliangruber\">Twitter/@juliangruber</a></td></tr>\n<tr><th align=\"left\">Paolo Fragomeni</th><td><a href=\"https://github.com/hij1nx\">GitHub/hij1nx</a></td><td><a href=\"http://twitter.com/hij1nx\">Twitter/@hij1nx</a></td></tr>\n<tr><th align=\"left\">Anton Whalley</th><td><a href=\"https://github.com/No9\">GitHub/No9</a></td><td><a href=\"https://twitter.com/antonwhalley\">Twitter/@antonwhalley</a></td></tr>\n<tr><th align=\"left\">Matteo Collina</th><td><a href=\"https://github.com/mcollina\">GitHub/mcollina</a></td><td><a href=\"https://twitter.com/matteocollina\">Twitter/@matteocollina</a></td></tr>\n<tr><th align=\"left\">Pedro Teixeira</th><td><a href=\"https://github.com/pgte\">GitHub/pgte</a></td><td><a href=\"https://twitter.com/pgte\">Twitter/@pgte</a></td></tr>\n<tr><th align=\"left\">James Halliday</th><td><a href=\"https://github.com/substack\">GitHub/substack</a></td><td><a href=\"https://twitter.com/substack\">Twitter/@substack</a></td></tr>\n</tbody></table>\n\n### Windows\n\nA large portion of the Windows support comes from code by [Krzysztof Kowalczyk](http://blog.kowalczyk.info/) [@kjk](https://twitter.com/kjk), see his Windows LevelDB port [here](http://code.google.com/r/kkowalczyk-leveldb/). If you're using LevelUP on Windows, you should give him your thanks!\n\n\n<a name=\"licence\"></a>\nLicence &amp; copyright\n-------------------\n\nCopyright (c) 2012-2013 LevelUP contributors (listed above).\n\nLevelUP is licensed under an MIT +no-false-attribs license. All rights not explicitly granted in the MIT license are reserved. See the included LICENSE file for more details.\n\n=======\n*LevelUP builds on the excellent work of the LevelDB and Snappy teams from Google and additional contributors. LevelDB and Snappy are both issued under the [New BSD Licence](http://opensource.org/licenses/BSD-3-Clause).*\n",
   "readmeFilename": "README.md",
   "bugs": {
     "url": "https://github.com/rvagg/node-levelup/issues"
   },
-  "_id": "levelup@0.18.2",
-  "_from": "levelup@"
+  "_id": "levelup@0.18.3",
+  "_from": "levelup@^0.18.2"
 }
 
-},{}],106:[function(require,module,exports){
+},{}],78:[function(require,module,exports){
 (function (process,global){
 var util              = require('util')
   , bops              = require('bops')
@@ -12376,7 +11372,7 @@ function MemIterator (db, options) {
       this._pos = -1
   }
 
-  if (!options.start || !this._pos)
+  if (!options.start || this._pos === undefined)
     this._pos = this._reverse ? this.db._keys.length - 1 : 0
 
   // copy the keys that we need so that they're not affected by puts/deletes
@@ -12497,312 +11493,691 @@ MemDOWN.prototype._isBuffer = function (obj) {
 
 module.exports = MemDOWN
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"abstract-leveldown":109,"bops":116,"util":26}],107:[function(require,module,exports){
-module.exports=require(70)
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16}],108:[function(require,module,exports){
-module.exports=require(71)
-},{"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16}],109:[function(require,module,exports){
-(function (process,Buffer){
-/* Copyright (c) 2013 Rod Vagg, MIT License */
+}).call(this,require("/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"abstract-leveldown":81,"bops":88,"util":23}],79:[function(require,module,exports){
+module.exports=require(55)
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13}],80:[function(require,module,exports){
+module.exports=require(56)
+},{"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13}],81:[function(require,module,exports){
+arguments[4][57][0].apply(exports,arguments)
+},{"./abstract-chained-batch":79,"./abstract-iterator":80,"/home/ryan/.local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":13,"buffer":2,"xtend":83}],82:[function(require,module,exports){
+module.exports=require(32)
+},{}],83:[function(require,module,exports){
+arguments[4][33][0].apply(exports,arguments)
+},{"./has-keys":82,"object-keys":85}],84:[function(require,module,exports){
+module.exports=require(43)
+},{}],85:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"./shim":87}],86:[function(require,module,exports){
+module.exports=require(45)
+},{}],87:[function(require,module,exports){
+module.exports=require(46)
+},{"./foreach":84,"./isArguments":86}],88:[function(require,module,exports){
+var proto = {}
+module.exports = proto
 
-var xtend                = require('xtend')
-  , AbstractIterator     = require('./abstract-iterator')
-  , AbstractChainedBatch = require('./abstract-chained-batch')
+proto.from = require('./from.js')
+proto.to = require('./to.js')
+proto.is = require('./is.js')
+proto.subarray = require('./subarray.js')
+proto.join = require('./join.js')
+proto.copy = require('./copy.js')
+proto.create = require('./create.js')
 
-function AbstractLevelDOWN (location) {
-  if (!arguments.length || location === undefined)
-    throw new Error('constructor requires at least a location argument')
+mix(require('./read.js'), proto)
+mix(require('./write.js'), proto)
 
-  if (typeof location != 'string')
-    throw new Error('constructor requires a location string argument')
-
-  this.location = location
+function mix(from, into) {
+  for(var key in from) {
+    into[key] = from[key]
+  }
 }
 
-AbstractLevelDOWN.prototype.open = function (options, callback) {
-  if (typeof options == 'function')
-    callback = options
+},{"./copy.js":91,"./create.js":92,"./from.js":93,"./is.js":94,"./join.js":95,"./read.js":97,"./subarray.js":98,"./to.js":99,"./write.js":100}],89:[function(require,module,exports){
+(function (exports) {
+	'use strict';
 
-  if (typeof callback != 'function')
-    throw new Error('open() requires a callback argument')
+	var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
-  if (typeof options != 'object')
-    options = {}
+	function b64ToByteArray(b64) {
+		var i, j, l, tmp, placeHolders, arr;
+	
+		if (b64.length % 4 > 0) {
+			throw 'Invalid string. Length must be a multiple of 4';
+		}
 
-  if (typeof this._open == 'function')
-    return this._open(options, callback)
+		// the number of equal signs (place holders)
+		// if there are two placeholders, than the two characters before it
+		// represent one byte
+		// if there is only one, then the three characters before it represent 2 bytes
+		// this is just a cheap hack to not do indexOf twice
+		placeHolders = b64.indexOf('=');
+		placeHolders = placeHolders > 0 ? b64.length - placeHolders : 0;
 
-  process.nextTick(callback)
+		// base64 is 4/3 + up to two characters of the original data
+		arr = [];//new Uint8Array(b64.length * 3 / 4 - placeHolders);
+
+		// if there are placeholders, only get up to the last complete 4 chars
+		l = placeHolders > 0 ? b64.length - 4 : b64.length;
+
+		for (i = 0, j = 0; i < l; i += 4, j += 3) {
+			tmp = (lookup.indexOf(b64[i]) << 18) | (lookup.indexOf(b64[i + 1]) << 12) | (lookup.indexOf(b64[i + 2]) << 6) | lookup.indexOf(b64[i + 3]);
+			arr.push((tmp & 0xFF0000) >> 16);
+			arr.push((tmp & 0xFF00) >> 8);
+			arr.push(tmp & 0xFF);
+		}
+
+		if (placeHolders === 2) {
+			tmp = (lookup.indexOf(b64[i]) << 2) | (lookup.indexOf(b64[i + 1]) >> 4);
+			arr.push(tmp & 0xFF);
+		} else if (placeHolders === 1) {
+			tmp = (lookup.indexOf(b64[i]) << 10) | (lookup.indexOf(b64[i + 1]) << 4) | (lookup.indexOf(b64[i + 2]) >> 2);
+			arr.push((tmp >> 8) & 0xFF);
+			arr.push(tmp & 0xFF);
+		}
+
+		return arr;
+	}
+
+	function uint8ToBase64(uint8) {
+		var i,
+			extraBytes = uint8.length % 3, // if we have 1 byte left, pad 2 bytes
+			output = "",
+			temp, length;
+
+		function tripletToBase64 (num) {
+			return lookup[num >> 18 & 0x3F] + lookup[num >> 12 & 0x3F] + lookup[num >> 6 & 0x3F] + lookup[num & 0x3F];
+		};
+
+		// go through the array every three bytes, we'll deal with trailing stuff later
+		for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
+			temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2]);
+			output += tripletToBase64(temp);
+		}
+
+		// pad the end with zeros, but make sure to not forget the extra bytes
+		switch (extraBytes) {
+			case 1:
+				temp = uint8[uint8.length - 1];
+				output += lookup[temp >> 2];
+				output += lookup[(temp << 4) & 0x3F];
+				output += '==';
+				break;
+			case 2:
+				temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1]);
+				output += lookup[temp >> 10];
+				output += lookup[(temp >> 4) & 0x3F];
+				output += lookup[(temp << 2) & 0x3F];
+				output += '=';
+				break;
+		}
+
+		return output;
+	}
+
+	module.exports.toByteArray = b64ToByteArray;
+	module.exports.fromByteArray = uint8ToBase64;
+}());
+
+},{}],90:[function(require,module,exports){
+module.exports = to_utf8
+
+var out = []
+  , col = []
+  , fcc = String.fromCharCode
+  , mask = [0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01]
+  , unmask = [
+      0x00
+    , 0x01
+    , 0x02 | 0x01
+    , 0x04 | 0x02 | 0x01
+    , 0x08 | 0x04 | 0x02 | 0x01
+    , 0x10 | 0x08 | 0x04 | 0x02 | 0x01
+    , 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01
+    , 0x40 | 0x20 | 0x10 | 0x08 | 0x04 | 0x02 | 0x01
+  ]
+
+function to_utf8(bytes, start, end) {
+  start = start === undefined ? 0 : start
+  end = end === undefined ? bytes.length : end
+
+  var idx = 0
+    , hi = 0x80
+    , collecting = 0
+    , pos
+    , by
+
+  col.length =
+  out.length = 0
+
+  while(idx < bytes.length) {
+    by = bytes[idx]
+    if(!collecting && by & hi) {
+      pos = find_pad_position(by)
+      collecting += pos
+      if(pos < 8) {
+        col[col.length] = by & unmask[6 - pos]
+      }
+    } else if(collecting) {
+      col[col.length] = by & unmask[6]
+      --collecting
+      if(!collecting && col.length) {
+        out[out.length] = fcc(reduced(col, pos))
+        col.length = 0
+      }
+    } else { 
+      out[out.length] = fcc(by)
+    }
+    ++idx
+  }
+  if(col.length && !collecting) {
+    out[out.length] = fcc(reduced(col, pos))
+    col.length = 0
+  }
+  return out.join('')
 }
 
-AbstractLevelDOWN.prototype.close = function (callback) {
-  if (typeof callback != 'function')
-    throw new Error('close() requires a callback argument')
-
-  if (typeof this._close == 'function')
-    return this._close(callback)
-
-  process.nextTick(callback)
+function find_pad_position(byt) {
+  for(var i = 0; i < 7; ++i) {
+    if(!(byt & mask[i])) {
+      break
+    }
+  }
+  return i
 }
 
-AbstractLevelDOWN.prototype.get = function (key, options, callback) {
-  var err
-
-  if (typeof options == 'function')
-    callback = options
-
-  if (typeof callback != 'function')
-    throw new Error('get() requires a callback argument')
-
-  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
-    return callback(err)
-
-  if (!this._isBuffer(key))
-    key = String(key)
-
-  if (typeof options != 'object')
-    options = {}
-
-  if (typeof this._get == 'function')
-    return this._get(key, options, callback)
-
-  process.nextTick(function () { callback(new Error('NotFound')) })
+function reduced(list) {
+  var out = 0
+  for(var i = 0, len = list.length; i < len; ++i) {
+    out |= list[i] << ((len - i - 1) * 6)
+  }
+  return out
 }
 
-AbstractLevelDOWN.prototype.put = function (key, value, options, callback) {
-  var err
+},{}],91:[function(require,module,exports){
+module.exports = copy
 
-  if (typeof options == 'function')
-    callback = options
+var slice = [].slice
 
-  if (typeof callback != 'function')
-    throw new Error('put() requires a callback argument')
+function copy(source, target, target_start, source_start, source_end) {
+  target_start = arguments.length < 3 ? 0 : target_start
+  source_start = arguments.length < 4 ? 0 : source_start
+  source_end = arguments.length < 5 ? source.length : source_end
 
-  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
-    return callback(err)
+  if(source_end === source_start) {
+    return
+  }
 
-  if (err = this._checkKeyValue(value, 'value', this._isBuffer))
-    return callback(err)
+  if(target.length === 0 || source.length === 0) {
+    return
+  }
 
-  if (!this._isBuffer(key))
-    key = String(key)
+  if(source_end > source.length) {
+    source_end = source.length
+  }
 
-  // coerce value to string in node, don't touch it in browser
-  // (indexeddb can store any JS type)
-  if (!this._isBuffer(value) && !process.browser)
-    value = String(value)
+  if(target.length - target_start < source_end - source_start) {
+    source_end = target.length - target_start + source_start
+  }
 
-  if (typeof options != 'object')
-    options = {}
-
-  if (typeof this._put == 'function')
-    return this._put(key, value, options, callback)
-
-  process.nextTick(callback)
+  if(source.buffer !== target.buffer) {
+    return fast_copy(source, target, target_start, source_start, source_end)
+  }
+  return slow_copy(source, target, target_start, source_start, source_end)
 }
 
-AbstractLevelDOWN.prototype.del = function (key, options, callback) {
-  var err
+function fast_copy(source, target, target_start, source_start, source_end) {
+  var len = (source_end - source_start) + target_start
 
-  if (typeof options == 'function')
-    callback = options
-
-  if (typeof callback != 'function')
-    throw new Error('del() requires a callback argument')
-
-  if (err = this._checkKeyValue(key, 'key', this._isBuffer))
-    return callback(err)
-
-  if (!this._isBuffer(key))
-    key = String(key)
-
-  if (typeof options != 'object')
-    options = {}
-
-  if (typeof this._del == 'function')
-    return this._del(key, options, callback)
-
-  process.nextTick(callback)
+  for(var i = target_start, j = source_start;
+      i < len;
+      ++i,
+      ++j) {
+    target[i] = source[j]
+  }
 }
 
-AbstractLevelDOWN.prototype.batch = function (array, options, callback) {
-  if (!arguments.length)
-    return this._chainedBatch()
+function slow_copy(from, to, j, i, jend) {
+  // the buffers could overlap.
+  var iend = jend + i
+    , tmp = new Uint8Array(slice.call(from, i, iend))
+    , x = 0
 
-  if (typeof options == 'function')
-    callback = options
+  for(; i < iend; ++i, ++x) {
+    to[j++] = tmp[x]
+  }
+}
 
-  if (typeof callback != 'function')
-    throw new Error('batch(array) requires a callback argument')
+},{}],92:[function(require,module,exports){
+module.exports = function(size) {
+  return new Uint8Array(size)
+}
 
-  if (!Array.isArray(array))
-    return callback(new Error('batch(array) requires an array argument'))
+},{}],93:[function(require,module,exports){
+module.exports = from
 
-  if (typeof options != 'object')
-    options = {}
+var base64 = require('base64-js')
 
-  var i = 0
-    , l = array.length
-    , e
-    , err
+var decoders = {
+    hex: from_hex
+  , utf8: from_utf
+  , base64: from_base64
+}
 
-  for (; i < l; i++) {
-    e = array[i]
-    if (typeof e != 'object')
-      continue
+function from(source, encoding) {
+  if(Array.isArray(source)) {
+    return new Uint8Array(source)
+  }
 
-    if (err = this._checkKeyValue(e.type, 'type', this._isBuffer))
-      return callback(err)
+  return decoders[encoding || 'utf8'](source)
+}
 
-    if (err = this._checkKeyValue(e.key, 'key', this._isBuffer))
-      return callback(err)
+function from_hex(str) {
+  var size = str.length / 2
+    , buf = new Uint8Array(size)
+    , character = ''
 
-    if (e.type == 'put') {
-      if (err = this._checkKeyValue(e.value, 'value', this._isBuffer))
-        return callback(err)
+  for(var i = 0, len = str.length; i < len; ++i) {
+    character += str.charAt(i)
+
+    if(i > 0 && (i % 2) === 1) {
+      buf[i>>>1] = parseInt(character, 16)
+      character = '' 
     }
   }
 
-  if (typeof this._batch == 'function')
-    return this._batch(array, options, callback)
-
-  process.nextTick(callback)
+  return buf 
 }
 
-//TODO: remove from here, not a necessary primitive
-AbstractLevelDOWN.prototype.approximateSize = function (start, end, callback) {
-  if (   start == null
-      || end == null
-      || typeof start == 'function'
-      || typeof end == 'function') {
-    throw new Error('approximateSize() requires valid `start`, `end` and `callback` arguments')
+function from_utf(str) {
+  var arr = []
+    , code
+
+  for(var i = 0, len = str.length; i < len; ++i) {
+    code = fixed_cca(str, i)
+
+    if(code === false) {
+      continue
+    }
+
+    if(code < 0x80) {
+      arr[arr.length] = code
+
+      continue
+    }
+
+    codepoint_to_bytes(arr, code)
   }
 
-  if (typeof callback != 'function')
-    throw new Error('approximateSize() requires a callback argument')
-
-  if (!this._isBuffer(start))
-    start = String(start)
-
-  if (!this._isBuffer(end))
-    end = String(end)
-
-  if (typeof this._approximateSize == 'function')
-    return this._approximateSize(start, end, callback)
-
-  process.nextTick(function () {
-    callback(null, 0)
-  })
+  return new Uint8Array(arr)
 }
 
-AbstractLevelDOWN.prototype._setupIteratorOptions = function (options) {
-  var self = this
+function codepoint_to_bytes(arr, code) {
+  // find MSB, use that to determine byte count
+  var copy_code = code
+    , bit_count = 0
+    , byte_count
+    , prefix
+    , _byte
+    , pos
 
-  options = xtend(options)
+  do {
+    ++bit_count
+  } while(copy_code >>>= 1)
 
-  ;[ 'start', 'end', 'gt', 'gte', 'lt', 'lte' ].forEach(function (o) {
-    if (options[o] && self._isBuffer(options[o]) && options[o].length === 0)
-      delete options[o]
-  })
+  byte_count = Math.ceil((bit_count - 1) / 5) | 0
+  prefix = [0, 0, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc][byte_count]
+  pos = [0, 0, 3, 4, 5, 6, 7][byte_count]
 
-  options.reverse = !!options.reverse
+  _byte |= prefix
 
-  // fix `start` so it takes into account gt, gte, lt, lte as appropriate
-  if (options.reverse && options.lt)
-    options.start = options.lt
-  if (options.reverse && options.lte)
-    options.start = options.lte
-  if (!options.reverse && options.gt)
-    options.start = options.gt
-  if (!options.reverse && options.gte)
-    options.start = options.gte
+  bit_count = (7 - pos) + 6 * (byte_count - 1)
 
-  if ((options.reverse && options.lt && !options.lte)
-    || (!options.reverse && options.gt && !options.gte))
-    options.exclusiveStart = true // start should *not* include matching key
+  while(bit_count) {
+    _byte |= +!!(code & (1 << bit_count)) << (7 - pos)
+    ++pos
 
-  return options
+    if(pos % 8 === 0) {
+      arr[arr.length] = _byte
+      _byte = 0x80
+      pos = 2
+    }
+
+    --bit_count
+  }
+
+  if(pos) {
+    _byte |= +!!(code & 1) << (7 - pos)
+    arr[arr.length] = _byte
+  }
 }
 
-AbstractLevelDOWN.prototype.iterator = function (options) {
-  if (typeof options != 'object')
-    options = {}
+function pad(str) {
+  while(str.length < 8) {
+    str = '0' + str
+  }
 
-  options = this._setupIteratorOptions(options)
-
-  if (typeof this._iterator == 'function')
-    return this._iterator(options)
-
-  return new AbstractIterator(this)
+  return str
 }
 
-AbstractLevelDOWN.prototype._chainedBatch = function () {
-  return new AbstractChainedBatch(this)
+function fixed_cca(str, idx) {
+  idx = idx || 0
+
+  var code = str.charCodeAt(idx)
+    , lo
+    , hi
+
+  if(0xD800 <= code && code <= 0xDBFF) {
+    lo = str.charCodeAt(idx + 1)
+    hi = code
+
+    if(isNaN(lo)) {
+      throw new Error('High surrogate not followed by low surrogate')
+    }
+
+    return ((hi - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000
+  }
+
+  if(0xDC00 <= code && code <= 0xDFFF) {
+    return false
+  }
+
+  return code
 }
 
-AbstractLevelDOWN.prototype._isBuffer = function (obj) {
-  return Buffer.isBuffer(obj)
+function from_base64(str) {
+  return new Uint8Array(base64.toByteArray(str)) 
 }
 
-AbstractLevelDOWN.prototype._checkKeyValue = function (obj, type) {
-  if (obj === null || obj === undefined)
-    return new Error(type + ' cannot be `null` or `undefined`')
+},{"base64-js":89}],94:[function(require,module,exports){
 
-  if (obj === null || obj === undefined)
-    return new Error(type + ' cannot be `null` or `undefined`')
-
-  if (this._isBuffer(obj)) {
-    if (obj.length === 0)
-      return new Error(type + ' cannot be an empty Buffer')
-  } else if (String(obj) === '')
-    return new Error(type + ' cannot be an empty String')
+module.exports = function(buffer) {
+  return buffer instanceof Uint8Array;
 }
 
-module.exports.AbstractLevelDOWN    = AbstractLevelDOWN
-module.exports.AbstractIterator     = AbstractIterator
-module.exports.AbstractChainedBatch = AbstractChainedBatch
+},{}],95:[function(require,module,exports){
+module.exports = join
 
-}).call(this,require("/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),require("buffer").Buffer)
-},{"./abstract-chained-batch":107,"./abstract-iterator":108,"/home/ryan/ndn-modules/ndn-cache/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":16,"buffer":5,"xtend":111}],110:[function(require,module,exports){
-module.exports=require(34)
-},{}],111:[function(require,module,exports){
-arguments[4][35][0].apply(exports,arguments)
-},{"./has-keys":110,"object-keys":113}],112:[function(require,module,exports){
-module.exports=require(45)
-},{}],113:[function(require,module,exports){
-arguments[4][36][0].apply(exports,arguments)
-},{"./shim":115}],114:[function(require,module,exports){
-module.exports=require(47)
-},{}],115:[function(require,module,exports){
-module.exports=require(48)
-},{"./foreach":112,"./isArguments":114}],116:[function(require,module,exports){
-module.exports=require(55)
-},{"./copy.js":119,"./create.js":120,"./from.js":121,"./is.js":122,"./join.js":123,"./read.js":125,"./subarray.js":126,"./to.js":127,"./write.js":128}],117:[function(require,module,exports){
-module.exports=require(56)
-},{}],118:[function(require,module,exports){
-module.exports=require(57)
-},{}],119:[function(require,module,exports){
-module.exports=require(58)
-},{}],120:[function(require,module,exports){
-module.exports=require(59)
-},{}],121:[function(require,module,exports){
-module.exports=require(60)
-},{"base64-js":117}],122:[function(require,module,exports){
-module.exports=require(61)
-},{}],123:[function(require,module,exports){
-module.exports=require(62)
-},{}],124:[function(require,module,exports){
-module.exports=require(63)
-},{}],125:[function(require,module,exports){
-module.exports=require(64)
-},{"./mapped.js":124}],126:[function(require,module,exports){
-module.exports=require(65)
-},{}],127:[function(require,module,exports){
-module.exports=require(66)
-},{"base64-js":117,"to-utf8":118}],128:[function(require,module,exports){
-module.exports=require(67)
-},{"./mapped.js":124}],129:[function(require,module,exports){
+function join(targets, hint) {
+  if(!targets.length) {
+    return new Uint8Array(0)
+  }
+
+  var len = hint !== undefined ? hint : get_length(targets)
+    , out = new Uint8Array(len)
+    , cur = targets[0]
+    , curlen = cur.length
+    , curidx = 0
+    , curoff = 0
+    , i = 0
+
+  while(i < len) {
+    if(curoff === curlen) {
+      curoff = 0
+      ++curidx
+      cur = targets[curidx]
+      curlen = cur && cur.length
+      continue
+    }
+    out[i++] = cur[curoff++] 
+  }
+
+  return out
+}
+
+function get_length(targets) {
+  var size = 0
+  for(var i = 0, len = targets.length; i < len; ++i) {
+    size += targets[i].byteLength
+  }
+  return size
+}
+
+},{}],96:[function(require,module,exports){
+var proto
+  , map
+
+module.exports = proto = {}
+
+map = typeof WeakMap === 'undefined' ? null : new WeakMap
+
+proto.get = !map ? no_weakmap_get : get
+
+function no_weakmap_get(target) {
+  return new DataView(target.buffer, 0)
+}
+
+function get(target) {
+  var out = map.get(target.buffer)
+  if(!out) {
+    map.set(target.buffer, out = new DataView(target.buffer, 0))
+  }
+  return out
+}
+
+},{}],97:[function(require,module,exports){
+module.exports = {
+    readUInt8:      read_uint8
+  , readInt8:       read_int8
+  , readUInt16LE:   read_uint16_le
+  , readUInt32LE:   read_uint32_le
+  , readInt16LE:    read_int16_le
+  , readInt32LE:    read_int32_le
+  , readFloatLE:    read_float_le
+  , readDoubleLE:   read_double_le
+  , readUInt16BE:   read_uint16_be
+  , readUInt32BE:   read_uint32_be
+  , readInt16BE:    read_int16_be
+  , readInt32BE:    read_int32_be
+  , readFloatBE:    read_float_be
+  , readDoubleBE:   read_double_be
+}
+
+var map = require('./mapped.js')
+
+function read_uint8(target, at) {
+  return target[at]
+}
+
+function read_int8(target, at) {
+  var v = target[at];
+  return v < 0x80 ? v : v - 0x100
+}
+
+function read_uint16_le(target, at) {
+  var dv = map.get(target);
+  return dv.getUint16(at + target.byteOffset, true)
+}
+
+function read_uint32_le(target, at) {
+  var dv = map.get(target);
+  return dv.getUint32(at + target.byteOffset, true)
+}
+
+function read_int16_le(target, at) {
+  var dv = map.get(target);
+  return dv.getInt16(at + target.byteOffset, true)
+}
+
+function read_int32_le(target, at) {
+  var dv = map.get(target);
+  return dv.getInt32(at + target.byteOffset, true)
+}
+
+function read_float_le(target, at) {
+  var dv = map.get(target);
+  return dv.getFloat32(at + target.byteOffset, true)
+}
+
+function read_double_le(target, at) {
+  var dv = map.get(target);
+  return dv.getFloat64(at + target.byteOffset, true)
+}
+
+function read_uint16_be(target, at) {
+  var dv = map.get(target);
+  return dv.getUint16(at + target.byteOffset, false)
+}
+
+function read_uint32_be(target, at) {
+  var dv = map.get(target);
+  return dv.getUint32(at + target.byteOffset, false)
+}
+
+function read_int16_be(target, at) {
+  var dv = map.get(target);
+  return dv.getInt16(at + target.byteOffset, false)
+}
+
+function read_int32_be(target, at) {
+  var dv = map.get(target);
+  return dv.getInt32(at + target.byteOffset, false)
+}
+
+function read_float_be(target, at) {
+  var dv = map.get(target);
+  return dv.getFloat32(at + target.byteOffset, false)
+}
+
+function read_double_be(target, at) {
+  var dv = map.get(target);
+  return dv.getFloat64(at + target.byteOffset, false)
+}
+
+},{"./mapped.js":96}],98:[function(require,module,exports){
+module.exports = subarray
+
+function subarray(buf, from, to) {
+  return buf.subarray(from || 0, to || buf.length)
+}
+
+},{}],99:[function(require,module,exports){
+module.exports = to
+
+var base64 = require('base64-js')
+  , toutf8 = require('to-utf8')
+
+var encoders = {
+    hex: to_hex
+  , utf8: to_utf
+  , base64: to_base64
+}
+
+function to(buf, encoding) {
+  return encoders[encoding || 'utf8'](buf)
+}
+
+function to_hex(buf) {
+  var str = ''
+    , byt
+
+  for(var i = 0, len = buf.length; i < len; ++i) {
+    byt = buf[i]
+    str += ((byt & 0xF0) >>> 4).toString(16)
+    str += (byt & 0x0F).toString(16)
+  }
+
+  return str
+}
+
+function to_utf(buf) {
+  return toutf8(buf)
+}
+
+function to_base64(buf) {
+  return base64.fromByteArray(buf)
+}
+
+
+},{"base64-js":89,"to-utf8":90}],100:[function(require,module,exports){
+module.exports = {
+    writeUInt8:      write_uint8
+  , writeInt8:       write_int8
+  , writeUInt16LE:   write_uint16_le
+  , writeUInt32LE:   write_uint32_le
+  , writeInt16LE:    write_int16_le
+  , writeInt32LE:    write_int32_le
+  , writeFloatLE:    write_float_le
+  , writeDoubleLE:   write_double_le
+  , writeUInt16BE:   write_uint16_be
+  , writeUInt32BE:   write_uint32_be
+  , writeInt16BE:    write_int16_be
+  , writeInt32BE:    write_int32_be
+  , writeFloatBE:    write_float_be
+  , writeDoubleBE:   write_double_be
+}
+
+var map = require('./mapped.js')
+
+function write_uint8(target, value, at) {
+  return target[at] = value
+}
+
+function write_int8(target, value, at) {
+  return target[at] = value < 0 ? value + 0x100 : value
+}
+
+function write_uint16_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setUint16(at + target.byteOffset, value, true)
+}
+
+function write_uint32_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setUint32(at + target.byteOffset, value, true)
+}
+
+function write_int16_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setInt16(at + target.byteOffset, value, true)
+}
+
+function write_int32_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setInt32(at + target.byteOffset, value, true)
+}
+
+function write_float_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setFloat32(at + target.byteOffset, value, true)
+}
+
+function write_double_le(target, value, at) {
+  var dv = map.get(target);
+  return dv.setFloat64(at + target.byteOffset, value, true)
+}
+
+function write_uint16_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setUint16(at + target.byteOffset, value, false)
+}
+
+function write_uint32_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setUint32(at + target.byteOffset, value, false)
+}
+
+function write_int16_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setInt16(at + target.byteOffset, value, false)
+}
+
+function write_int32_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setInt32(at + target.byteOffset, value, false)
+}
+
+function write_float_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setFloat32(at + target.byteOffset, value, false)
+}
+
+function write_double_be(target, value, at) {
+  var dv = map.get(target);
+  return dv.setFloat64(at + target.byteOffset, value, false)
+}
+
+},{"./mapped.js":96}],101:[function(require,module,exports){
 /*! asn1hex-1.1.js (c) 2012 Kenji Urushima | kjur.github.com/jsrsasign/license
  */
 //
@@ -13097,7 +12472,7 @@ ASN1HEX.getDecendantHexTLVByNthList = _asnhex_getDecendantHexTLVByNthList;
 
 module.exports = ASN1HEX;
 
-},{"jsbn":179}],130:[function(require,module,exports){
+},{"jsbn":152}],102:[function(require,module,exports){
 var b64map="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 var b64pad="=";
 var BI_RM = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -13173,7 +12548,7 @@ function b64toBA(s) {
 
 module.exports = {b64tohex: b64tohex, b64toBA: b64toBA, hex2b64: hex2b64};
 
-},{}],131:[function(require,module,exports){
+},{}],103:[function(require,module,exports){
 /*
 CryptoJS v3.1.2
 code.google.com/p/crypto-js
@@ -13889,7 +13264,7 @@ var CryptoJS = CryptoJS || (function (Math, undefined) {
 
 module.exports = CryptoJS
 
-},{}],132:[function(require,module,exports){
+},{}],104:[function(require,module,exports){
 /*! crypto-1.0.4.js (c) 2013 Kenji Urushima | kjur.github.com/jsrsasign/license
  */
 /*
@@ -14583,7 +13958,7 @@ KJUR.crypto.Signature = function(params) {
 };
 module.exports = KJUR
 
-},{"./sha256.js":137,"jsbn":179}],133:[function(require,module,exports){
+},{"./sha256.js":109,"jsbn":152}],105:[function(require,module,exports){
 // Depends on jsbn.js and rng.js
 var BigInteger = require('jsbn')
 // Version 1.1: support utf-8 encoding in pkcs1pad2
@@ -14774,7 +14149,7 @@ RSAKey.prototype.encryptOAEP = RSAEncryptOAEP;
 module.exports = RSAKey
 //RSAKey.prototype.encrypt_b64 = RSAEncryptB64;
 
-},{"jsbn":179}],134:[function(require,module,exports){
+},{"jsbn":152}],106:[function(require,module,exports){
 // Depends on rsa.js and jsbn2.js
 var BigInteger = require('jsbn')
 var RSAKey = require('./rsa.js')
@@ -15025,7 +14400,7 @@ RSAKey.prototype.decryptOAEP = RSADecryptOAEP;
 
 module.exports = RSAKey
 
-},{"./rsa.js":133,"jsbn":179}],135:[function(require,module,exports){
+},{"./rsa.js":105,"jsbn":152}],107:[function(require,module,exports){
 /*! rsapem-1.1.js (c) 2012 Kenji Urushima | kjur.github.com/jsrsasign/license
  */
 //
@@ -15133,7 +14508,7 @@ RSAKey.prototype.readPrivateKeyFromASN1HexString = _rsapem_readPrivateKeyFromASN
 
 module.exports = RSAKey
 
-},{"./asn1hex-1.1.js":129,"./base64.js":130,"./rsa2.js":134}],136:[function(require,module,exports){
+},{"./asn1hex-1.1.js":101,"./base64.js":102,"./rsa2.js":106}],108:[function(require,module,exports){
 /*! rsasign-1.2.2.js (c) 2012 Kenji Urushima | kjur.github.com/jsrsasign/license
  */
 //
@@ -15534,7 +14909,7 @@ RSAKey.SALT_LEN_RECOVER = -2;
 
 module.exports = RSAKey
 
-},{"./rsapem-1.1.js":135,"jsbn":179}],137:[function(require,module,exports){
+},{"./rsapem-1.1.js":107,"jsbn":152}],109:[function(require,module,exports){
 /*
 CryptoJS v3.1.2
 code.google.com/p/crypto-js
@@ -15721,7 +15096,7 @@ code.google.com/p/crypto-js/wiki/License
 
 module.exports = C
 
-},{"./core.js":131}],138:[function(require,module,exports){
+},{"./core.js":103}],110:[function(require,module,exports){
 exports.Face = require('./js/face.js').Face;
 exports.NDN = require('./js/face.js').NDN; // deprecated
 exports.Closure = require('./js/closure.js').Closure;
@@ -15742,6 +15117,8 @@ exports.PublisherPublicKeyDigest = require('./js/publisher-public-key-digest.js'
 exports.WireFormat = require('./js/encoding/wire-format.js').WireFormat;
 exports.BinaryXmlWireFormat = require('./js/encoding/binary-xml-wire-format.js').BinaryXmlWireFormat;
 exports.TlvWireFormat = require('./js/encoding/tlv-wire-format.js').TlvWireFormat;
+exports.TlvDecoder = require('./js/encoding/tlv/tlv-decoder.js').TlvDecoder;
+exports.Tlv = require('./js/encoding/tlv/tlv.js').Tlv
 exports.DataUtils = require('./js/encoding/data-utils.js').DataUtils;
 exports.EncodingUtils = require('./js/encoding/encoding-utils.js').EncodingUtils;
 exports.Blob = require('./js/util/blob.js').Blob;
@@ -15749,10 +15126,20 @@ exports.NameEnumeration = require('./js/util/name-enumeration.js').NameEnumerati
 exports.NDNTime = require('./js/util/ndn-time.js').NDNTime;
 exports.globalKeyManager = require('./js/security/key-manager.js').globalKeyManager;
 exports.ElementReader = require('./js/encoding/element-reader.js').ElementReader;
-exports.customBuffer = require('./js/browserify.js').Buffer
+exports.customBuffer = require('./js/buffer.js').Buffer
 
-},{"./js/browserify.js":139,"./js/closure.js":140,"./js/data.js":141,"./js/encoding/binary-xml-wire-format.js":145,"./js/encoding/data-utils.js":146,"./js/encoding/element-reader.js":148,"./js/encoding/encoding-utils.js":149,"./js/encoding/tlv-wire-format.js":151,"./js/encoding/wire-format.js":156,"./js/exclude.js":157,"./js/face.js":159,"./js/forwarding-flags.js":161,"./js/interest.js":162,"./js/key-locator.js":163,"./js/key.js":164,"./js/meta-info.js":166,"./js/name.js":167,"./js/publisher-public-key-digest.js":169,"./js/security/key-manager.js":170,"./js/util/blob.js":173,"./js/util/name-enumeration.js":175,"./js/util/ndn-time.js":177}],139:[function(require,module,exports){
-/** 
+},{"./js/buffer.js":112,"./js/closure.js":113,"./js/data.js":114,"./js/encoding/binary-xml-wire-format.js":118,"./js/encoding/data-utils.js":119,"./js/encoding/element-reader.js":121,"./js/encoding/encoding-utils.js":122,"./js/encoding/tlv-wire-format.js":124,"./js/encoding/tlv/tlv-decoder.js":125,"./js/encoding/tlv/tlv.js":128,"./js/encoding/wire-format.js":129,"./js/exclude.js":130,"./js/face.js":132,"./js/forwarding-flags.js":134,"./js/interest.js":135,"./js/key-locator.js":136,"./js/key.js":137,"./js/meta-info.js":139,"./js/name.js":140,"./js/publisher-public-key-digest.js":142,"./js/security/key-manager.js":143,"./js/util/blob.js":146,"./js/util/name-enumeration.js":148,"./js/util/ndn-time.js":150}],111:[function(require,module,exports){
+/**
+ * Copyright (C) 2013-2014 Regents of the University of California.
+ * @author: Jeff Thompson <jefft0@remap.ucla.edu>
+ * See COPYING for copyright and distribution information.
+ */
+
+// The Face constructor uses TcpTransport by default which is not available in the browser, so override to WebSocketTransport.
+exports.TcpTransport = require('./transport/web-socket-transport.js').WebSocketTransport;
+
+},{"./transport/web-socket-transport.js":145}],112:[function(require,module,exports){
+/**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Wentao Shang
  * See COPYING for copyright and distribution information.
@@ -15768,7 +15155,7 @@ var KJUR = require('../contrib/securityLib/crypto-1.0.js')
 var RSAKey = require('../contrib/securityLib/rsasign-1.2.js')
 var b64tohex = require('../contrib/securityLib/base64.js').b64tohex
 // Factory method to create node.js compatible buffer objects
-var customBuf = function customBuf(data, format) 
+var customBuf = function customBuf(data, format)
 {
   var obj;
 
@@ -15780,19 +15167,19 @@ var customBuf = function customBuf(data, format)
       obj = new Uint8Array(utf8.length);
       for (var i = 0; i < utf8.length; i++)
         obj[i] = utf8.charCodeAt(i);
-    } 
+    }
     else if (format == 'binary') {
       obj = new Uint8Array(data.length);
       for (var i = 0; i < data.length; i++)
         obj[i] = data.charCodeAt(i);
-    } 
+    }
     else if (format == 'hex') {
       obj = new Uint8Array(Math.floor(data.length / 2));
       var i = 0;
       data.replace(/(..)/g, function(ss) {
         obj[i++] = parseInt(ss, 16);
       });
-    } 
+    }
     else if (format == 'base64') {
       var hex = b64tohex(data);
       obj = new Uint8Array(Math.floor(hex.length / 2));
@@ -15800,10 +15187,10 @@ var customBuf = function customBuf(data, format)
       hex.replace(/(..)/g, function(ss) {
         obj[i++] = parseInt(ss, 16);
       });
-    } 
-    else 
+    }
+    else
       throw new Error('Buffer: unknown encoding format ' + format);
-  } 
+  }
   else if (typeof data == 'object' && (data instanceof Uint8Array || data instanceof customBuf)) {
     // The second argument is a boolean for "copy", default true.
     if (format == false)
@@ -15828,7 +15215,7 @@ var customBuf = function customBuf(data, format)
   }
 
   obj.__proto__.toString = function(encoding) {
-    if (encoding == null) {
+    if (encoding == null || encoding == 'binary') {
       var ret = "";
       for (var i = 0; i < this.length; i++)
         ret += String.fromCharCode(this[i]);
@@ -15866,12 +15253,12 @@ var customBuf = function customBuf(data, format)
 
 customBuf.prototype = Uint8Array.prototype;
 
-customBuf.concat = function(arrays) 
+customBuf.concat = function(arrays)
 {
   var totalLength = 0;
   for (var i = 0; i < arrays.length; ++i)
     totalLength += arrays[i].length;
-    
+
   var result = new customBuf(totalLength);
   var offset = 0;
   for (var i = 0; i < arrays.length; ++i) {
@@ -15918,7 +15305,7 @@ customBuf.str2rstr_utf8 = function(input)
 };
 
 // Factory method to create hasher objects
-exports.createHash = function(alg) 
+exports.createHash = function(alg)
 {
   if (alg != 'sha256')
     throw new Error('createHash: unsupported algorithm.');
@@ -15939,7 +15326,7 @@ exports.createHash = function(alg)
 };
 
 // Factory method to create RSA signer objects
-exports.createSign = function(alg) 
+exports.createSign = function(alg)
 {
   if (alg != 'RSA-SHA256')
     throw new Error('createSign: unsupported algorithm.');
@@ -15967,37 +15354,37 @@ exports.createSign = function(alg)
 };
 
 // Factory method to create RSA verifier objects
-exports.createVerify = function(alg) 
+exports.createVerify = function(alg)
 {
   if (alg != 'RSA-SHA256')
     throw new Error('createSign: unsupported algorithm.');
 
   var obj = {};
-    
+
   obj.arr = [];
 
   obj.update = function(buf) {
     this.arr.push(buf);
   };
 
-  var getSubjectPublicKeyPosFromHex = function(hPub) {  
-    var a = ASN1HEX.getPosArrayOfChildren_AtObj(hPub, 0); 
-    if (a.length != 2) 
+  var getSubjectPublicKeyPosFromHex = function(hPub) {
+    var a = ASN1HEX.getPosArrayOfChildren_AtObj(hPub, 0);
+    if (a.length != 2)
       return -1;
     var pBitString = a[1];
-    if (hPub.substring(pBitString, pBitString + 2) != '03') 
+    if (hPub.substring(pBitString, pBitString + 2) != '03')
       return -1;
     var pBitStringV = ASN1HEX.getStartPosOfV_AtObj(hPub, pBitString);
-    if (hPub.substring(pBitStringV, pBitStringV + 2) != '00') 
+    if (hPub.substring(pBitStringV, pBitStringV + 2) != '00')
       return -1;
     return pBitStringV + 2;
   };
 
   var readPublicDER = function(pub_der) {
-    var hex = pub_der.toString('hex'); 
+    var hex = pub_der.toString('hex');
     var p = getSubjectPublicKeyPosFromHex(hex);
     var a = ASN1HEX.getPosArrayOfChildren_AtObj(hex, p);
-    if (a.length != 2) 
+    if (a.length != 2)
       return null;
     var hN = ASN1HEX.getHexOfV_AtObj(hex, a[0]);
     var hE = ASN1HEX.getHexOfV_AtObj(hex, a[1]);
@@ -16015,7 +15402,7 @@ exports.createVerify = function(alg)
     signer.initVerifyByPublicKey(rsa);
     for (var i = 0; i < this.arr.length; i++)
       signer.updateHex(this.arr[i].toString('hex'));
-    var hSig = sig.toString('hex'); 
+    var hSig = sig.toString('hex');
     return signer.verify(hSig);
   };
 
@@ -16035,7 +15422,7 @@ exports.Buffer = customBuf;
 
 module.exports = exports;
 
-},{"../contrib/securityLib/asn1hex-1.1.js":129,"../contrib/securityLib/base64.js":130,"../contrib/securityLib/crypto-1.0.js":132,"../contrib/securityLib/rsasign-1.2.js":136}],140:[function(require,module,exports){
+},{"../contrib/securityLib/asn1hex-1.1.js":101,"../contrib/securityLib/base64.js":102,"../contrib/securityLib/crypto-1.0.js":104,"../contrib/securityLib/rsasign-1.2.js":108}],113:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -16118,8 +15505,7 @@ UpcallInfo.prototype.toString = function()
 
 exports.UpcallInfo = UpcallInfo;
 
-},{}],141:[function(require,module,exports){
-(function (Buffer){
+},{}],114:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -16144,13 +15530,13 @@ var customBuf = require('./buffer.js').Buffer
  * Create a new Data with the optional values.  There are 2 forms of constructor:
  * new Data([name] [, content]);
  * new Data(name, metaInfo [, content]);
- * 
+ *
  * @constructor
  * @param {Name} name
  * @param {MetaInfo} metaInfo
  * @param {Buffer} content
  */
-var Data = function Data(name, metaInfoOrContent, arg3) 
+var Data = function Data(name, metaInfoOrContent, arg3)
 {
   if (typeof name === 'string')
     this.name = new Name(name);
@@ -16160,7 +15546,7 @@ var Data = function Data(name, metaInfoOrContent, arg3)
 
   var metaInfo;
   var content;
-  if (typeof metaInfoOrContent === 'object' && 
+  if (typeof metaInfoOrContent === 'object' &&
       metaInfoOrContent instanceof MetaInfo) {
     metaInfo = metaInfoOrContent;
     content = arg3;
@@ -16169,20 +15555,20 @@ var Data = function Data(name, metaInfoOrContent, arg3)
     metaInfo = null;
     content = metaInfoOrContent;
   }
-    
+
   // Use signedInfo instead of metaInfo for backward compatibility.
   this.signedInfo = typeof metaInfo === 'object' && metaInfo instanceof MetaInfo ?
        new MetaInfo(metaInfo) : new MetaInfo();
-  
-  if (typeof content === 'string') 
+
+  if (typeof content === 'string')
     this.content = DataUtils.toNumbersFromString(content);
   else if (typeof content === 'object' && content instanceof Blob)
     this.content = content.buf();
-  else 
+  else
     this.content = content;
-  
+
   this.signature = new Signature();
-  
+
   this.wireEncoding = SignedBlob();
 };
 
@@ -16192,7 +15578,7 @@ exports.Data = Data;
  * Get the data packet's name.
  * @returns {Name} The name.
  */
-Data.prototype.getName = function() 
+Data.prototype.getName = function()
 {
   return this.name;
 };
@@ -16201,7 +15587,7 @@ Data.prototype.getName = function()
  * Get the data packet's meta info.
  * @returns {MetaInfo} The meta info.
  */
-Data.prototype.getMetaInfo = function() 
+Data.prototype.getMetaInfo = function()
 {
   return this.signedInfo;
 };
@@ -16210,7 +15596,7 @@ Data.prototype.getMetaInfo = function()
  * Get the data packet's signature object.
  * @returns {Signature} The signature object.
  */
-Data.prototype.getSignature = function() 
+Data.prototype.getSignature = function()
 {
   return this.signature;
 };
@@ -16219,7 +15605,7 @@ Data.prototype.getSignature = function()
  * Get the data packet's content.
  * @returns {Buffer} The content as a customBuf, which is null if unspecified.
  */
-Data.prototype.getContent = function() 
+Data.prototype.getContent = function()
 {
   return this.content;
 };
@@ -16229,7 +15615,7 @@ Data.prototype.getContent = function()
  * @param {Name} name The Name which is copied.
  * @returns {Data} This Data so that you can chain calls to update values.
  */
-Data.prototype.setName = function(name) 
+Data.prototype.setName = function(name)
 {
   this.name = typeof name === 'object' && name instanceof Name ?
     new Name(name) : new Name();
@@ -16244,7 +15630,7 @@ Data.prototype.setName = function(name)
  * @param {MetaInfo} metaInfo The MetaInfo which is copied.
  * @returns {Data} This Data so that you can chain calls to update values.
  */
-Data.prototype.setMetaInfo = function(metaInfo) 
+Data.prototype.setMetaInfo = function(metaInfo)
 {
   this.signedInfo = typeof metaInfo === 'object' && metaInfo instanceof MetaInfo ?
     new MetaInfo(metaInfo) : new MetaInfo();
@@ -16259,7 +15645,7 @@ Data.prototype.setMetaInfo = function(metaInfo)
  * @param {Signature} signature The signature object which is cloned.
  * @returns {Data} This Data so that you can chain calls to update values.
  */
-Data.prototype.setSignature = function(signature) 
+Data.prototype.setSignature = function(signature)
 {
   this.signature = typeof signature === 'object' && signature instanceof Signature ?
     signature.clone() : new Signature();
@@ -16274,13 +15660,13 @@ Data.prototype.setSignature = function(signature)
  * @param {type} content The array this is copied.
  * @returns {Data} This Data so that you can chain calls to update values.
  */
-Data.prototype.setContent = function(content) 
+Data.prototype.setContent = function(content)
 {
-  if (typeof content === 'string') 
+  if (typeof content === 'string')
     this.content = DataUtils.toNumbersFromString(content);
   else if (typeof content === 'object' && content instanceof Blob)
     this.content = content.buf();
-  else 
+  else
     this.content = new customBuf(content);
 
   // The object has changed, so the wireEncoding is invalid.
@@ -16288,59 +15674,71 @@ Data.prototype.setContent = function(content)
   return this;
 };
 
-Data.prototype.sign = function(wireFormat) 
+Data.prototype.sign = function(wireFormat)
 {
   var rs = require('buffer')
   var ss = require('./crypto.js')
-  console.log(Buffer, ss, rs)
   wireFormat = (wireFormat || WireFormat.getDefaultWireFormat());
- 
+
   if (this.getSignatureOrMetaInfoKeyLocator() == null ||
       this.getSignatureOrMetaInfoKeyLocator().getType() == null)
     this.getMetaInfo().setFields();
-  
+
   if (this.wireEncoding == null || this.wireEncoding.isNull()) {
     // Need to encode to set wireEncoding.
     // Set an initial empty signature so that we can encode.
     this.getSignature().setSignature(new customBuf(128));
     this.wireEncode(wireFormat);
   }
-  
+
   var rsa = require("./crypto.js").createSign('RSA-SHA256');
   rsa.update(this.wireEncoding.signedBuf());
-    
-  var sig = new customBuf(rsa.sign(globalKeyManager.privateKey));
+
+  var sig = new customBuf
+    (DataUtils.toNumbersIfString(rsa.sign(globalKeyManager.privateKey)));
   this.signature.signature = sig;
 };
 
-Data.prototype.verify = function(/*Key*/ key) 
+// The first time verify is called, it sets this to determine if a signature
+//   buffer needs to be converted to a string for the crypto verifier.
+Data.verifyUsesString = null;
+Data.prototype.verify = function(/*Key*/ key)
 {
   if (key == null || key.publicKeyPem == null)
     throw new Error('Cannot verify Data without a public key.');
+
+  if (Data.verifyUsesString == null) {
+    var hashResult = require("crypto").createHash('sha256').digest();
+    // If the has result is a string, we assume that this is a version of
+    //   crypto where verify also uses a string signature.
+    Data.verifyUsesString = (typeof hashResult === 'string');
+  }
 
   if (this.wireEncoding == null || this.wireEncoding.isNull())
     // Need to encode to set wireEncoding.
     this.wireEncode();
   var verifier = require('./crypto.js').createVerify('RSA-SHA256');
   verifier.update(this.wireEncoding.signedBuf());
-  return verifier.verify(key.publicKeyPem, this.signature.signature);
+  var signatureBytes = Data.verifyUsesString ?
+    DataUtils.toString(this.signature.signature) : this.signature.signature;
+  return verifier.verify(key.publicKeyPem, signatureBytes);
 };
 
 Data.prototype.getElementLabel = function() { return NDNProtocolDTags.Data; };
 
 /**
  * Encode this Data for a particular wire format.
- * @param {a subclass of WireFormat} wireFormat (optional) A WireFormat object 
+ * @param {a subclass of WireFormat} wireFormat (optional) A WireFormat object
  * used to encode this object. If omitted, use WireFormat.getDefaultWireFormat().
  * @returns {SignedBlob} The encoded buffer in a SignedBlob object.
  */
-Data.prototype.wireEncode = function(wireFormat) 
+Data.prototype.wireEncode = function(wireFormat)
 {
   var wireFormat = (wireFormat || WireFormat.getDefaultWireFormat());
   var result = wireFormat.encodeData(this);
   // TODO: Implement setDefaultWireEncoding with getChangeCount support.
   this.wireEncoding = new SignedBlob
-    (result.encoding, result.signedPortionBeginOffset, 
+    (result.encoding, result.signedPortionBeginOffset,
      result.signedPortionEndOffset);
   return this.wireEncoding;
 };
@@ -16348,21 +15746,21 @@ Data.prototype.wireEncode = function(wireFormat)
 /**
  * Decode the input using a particular wire format and update this Data.
  * @param {Blob|Buffer} input The buffer with the bytes to decode.
- * @param {a subclass of WireFormat} wireFormat (optional) A WireFormat object 
+ * @param {a subclass of WireFormat} wireFormat (optional) A WireFormat object
  * used to decode this object. If omitted, use WireFormat.getDefaultWireFormat().
  */
-Data.prototype.wireDecode = function(input, wireFormat) 
+Data.prototype.wireDecode = function(input, wireFormat)
 {
   var wireFormat = (wireFormat || WireFormat.getDefaultWireFormat());
   // If input is a blob, get its buf().
-  var decodeBuffer = typeof input === 'object' && input instanceof Blob ? 
+  var decodeBuffer = typeof input === 'object' && input instanceof Blob ?
                      input.buf() : input;
   var result = wireFormat.decodeData(this, decodeBuffer);
   // TODO: Implement setDefaultWireEncoding with getChangeCount support.
-  // In the Blob constructor, set copy true, but if input is already a Blob, it 
+  // In the Blob constructor, set copy true, but if input is already a Blob, it
   //   won't copy.
   this.wireEncoding = new SignedBlob
-    (new Blob(input, true), result.signedPortionBeginOffset, 
+    (new Blob(input, true), result.signedPortionBeginOffset,
      result.signedPortionEndOffset);
 };
 
@@ -16382,7 +15780,7 @@ Data.prototype.getSignatureOrMetaInfoKeyLocator = function()
       this.signature.getKeyLocator().getType() >= 0)
     // The application is using the key locator in the correct object.
     return this.signature.getKeyLocator();
-  
+
   if (this.signedInfo != null && this.signedInfo.locator != null &&
       this.signedInfo.locator.type != null &&
       this.signedInfo.locator.type >= 0) {
@@ -16390,7 +15788,7 @@ Data.prototype.getSignatureOrMetaInfoKeyLocator = function()
     //console.log("WARNING: In the future, the key locator in the Signature object will not be supported.");
     return this.signedInfo.locator;
   }
-  
+
   // Return the empty key locator from the Signature object if possible.
   if (this.signature != null && this.signature.getKeyLocator() != null)
     return this.signature.getKeyLocator();
@@ -16404,7 +15802,7 @@ var BinaryXmlWireFormat = require('./encoding/binary-xml-wire-format.js').Binary
 /**
  * @deprecated Use BinaryXmlWireFormat.decodeData.
  */
-Data.prototype.from_ndnb = function(/*XMLDecoder*/ decoder) 
+Data.prototype.from_ndnb = function(/*XMLDecoder*/ decoder)
 {
   BinaryXmlWireFormat.decodeData(this, decoder);
 };
@@ -16421,7 +15819,7 @@ Data.prototype.to_ndnb = function(/*XMLEncoder*/ encoder)
  * @deprecated Use wireEncode.  If you need binary XML, use
  * wireEncode(BinaryXmlWireFormat.get()).
  */
-Data.prototype.encode = function(wireFormat) 
+Data.prototype.encode = function(wireFormat)
 {
   wireFormat = (wireFormat || BinaryXmlWireFormat.get());
   return wireFormat.encodeData(this).buf();
@@ -16431,7 +15829,7 @@ Data.prototype.encode = function(wireFormat)
  * @deprecated Use wireDecode.  If you need binary XML, use
  * wireDecode(input, BinaryXmlWireFormat.get()).
  */
-Data.prototype.decode = function(input, wireFormat) 
+Data.prototype.decode = function(input, wireFormat)
 {
   wireFormat = (wireFormat || BinaryXmlWireFormat.get());
   wireFormat.decodeData(this, input);
@@ -16440,18 +15838,17 @@ Data.prototype.decode = function(input, wireFormat)
 /**
  * @deprecated Use new Data.
  */
-var ContentObject = function ContentObject(name, signedInfo, content) 
+var ContentObject = function ContentObject(name, signedInfo, content)
 {
   // Call the base constructor.
-  Data.call(this, name, signedInfo, content); 
+  Data.call(this, name, signedInfo, content);
 }
 
 ContentObject.prototype = new Data();
 
 exports.ContentObject = ContentObject;
 
-}).call(this,require("buffer").Buffer)
-},{"./buffer.js":139,"./crypto.js":139,"./encoding/binary-xml-encoder.js":143,"./encoding/binary-xml-wire-format.js":145,"./encoding/data-utils.js":146,"./encoding/wire-format.js":156,"./key-locator.js":163,"./meta-info.js":166,"./name.js":167,"./security/key-manager.js":170,"./signature.js":171,"./util/blob.js":173,"./util/ndn-protoco-id-tags.js":176,"./util/signed-blob.js":178,"buffer":5}],142:[function(require,module,exports){
+},{"./buffer.js":112,"./crypto.js":112,"./encoding/binary-xml-encoder.js":116,"./encoding/binary-xml-wire-format.js":118,"./encoding/data-utils.js":119,"./encoding/wire-format.js":129,"./key-locator.js":136,"./meta-info.js":139,"./name.js":140,"./security/key-manager.js":143,"./signature.js":144,"./util/blob.js":146,"./util/ndn-protoco-id-tags.js":149,"./util/signed-blob.js":151,"buffer":2,"crypto":6}],115:[function(require,module,exports){
 /**
  * This class is used to decode ndnb binary elements (blob, type/value pairs).
  * 
@@ -17164,7 +16561,7 @@ BinaryXMLDecoder.prototype.seek = function(offset)
   this.offset = offset;
 };
 
-},{"../buffer.js":139,"../log.js":165,"../util/ndn-protoco-id-tags.js":176,"../util/ndn-time.js":177,"./data-utils.js":146,"./decoding-exception.js":147}],143:[function(require,module,exports){
+},{"../buffer.js":112,"../log.js":138,"../util/ndn-protoco-id-tags.js":149,"../util/ndn-time.js":150,"./data-utils.js":119,"./decoding-exception.js":120}],116:[function(require,module,exports){
 /**
  * This class is used to encode ndnb binary elements (blob, type/value pairs).
  * 
@@ -17600,7 +16997,7 @@ BinaryXMLEncoder.prototype.getReducedOstream = function()
   return this.ostream.slice(0, this.offset);
 };
 
-},{"../buffer.js":139,"../log.js":165,"../util/dynamic-buffer.js":174,"../util/ndn-protoco-id-tags.js":176,"./data-utils.js":146}],144:[function(require,module,exports){
+},{"../buffer.js":112,"../log.js":138,"../util/dynamic-buffer.js":147,"../util/ndn-protoco-id-tags.js":149,"./data-utils.js":119}],117:[function(require,module,exports){
 /**
  * This class uses BinaryXMLDecoder to follow the structure of a ndnb binary element to 
  * determine its end.
@@ -17795,7 +17192,7 @@ BinaryXMLStructureDecoder.prototype.seek = function(offset)
   this.offset = offset;
 };
 
-},{"../util/dynamic-buffer.js":174,"./binary-xml-decoder.js":142}],145:[function(require,module,exports){
+},{"../util/dynamic-buffer.js":147,"./binary-xml-decoder.js":115}],118:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -18132,7 +17529,7 @@ BinaryXmlWireFormat.decodeData = function(data, decoder)
            signedPortionEndOffset: signedPortionEndOffset };  
 };
 
-},{"../exclude.js":157,"../key-locator.js":163,"../meta-info.js":166,"../name.js":167,"../publisher-public-key-digest.js":169,"../signature.js":171,"../util/blob.js":173,"../util/ndn-protoco-id-tags.js":176,"./binary-xml-decoder.js":142,"./binary-xml-encoder.js":143,"./data-utils.js":146,"./wire-format.js":156}],146:[function(require,module,exports){
+},{"../exclude.js":130,"../key-locator.js":136,"../meta-info.js":139,"../name.js":140,"../publisher-public-key-digest.js":142,"../signature.js":144,"../util/blob.js":146,"../util/ndn-protoco-id-tags.js":149,"./binary-xml-decoder.js":115,"./binary-xml-encoder.js":116,"./data-utils.js":119,"./wire-format.js":129}],119:[function(require,module,exports){
 /**
  * This class contains utilities to help parse the data
  *
@@ -18142,8 +17539,7 @@ BinaryXmlWireFormat.decodeData = function(data, decoder)
  * See COPYING for copyright and distribution information.
  */
 var customBuf = require('../buffer.js').Buffer
-console.log(customBuf)
- 
+
 /**
  * A DataUtils has static methods for converting data.
  * @constructor
@@ -18158,7 +17554,7 @@ exports.DataUtils = new DataUtils();
 
 /*
  * NOTE THIS IS CURRENTLY NOT BEING USED
- * 
+ *
  */
 
 DataUtils.prototype.keyStr = "ABCDEFGHIJKLMNOP" +
@@ -18166,11 +17562,11 @@ DataUtils.prototype.keyStr = "ABCDEFGHIJKLMNOP" +
                    "ghijklmnopqrstuv" +
                    "wxyz0123456789+/" +
                    "=";
-               
+
 /**
  * Raw String to Base 64
  */
-DataUtils.prototype.stringtoBase64 = function stringtoBase64(input) 
+DataUtils.prototype.stringtoBase64 = function stringtoBase64(input)
 {
    //input = escape(input);
    var output = "";
@@ -18206,9 +17602,9 @@ DataUtils.prototype.stringtoBase64 = function stringtoBase64(input)
 };
 
 /**
- * Base 64 to Raw String 
+ * Base 64 to Raw String
  */
-DataUtils.prototype.base64toString = function base64toString(input) 
+DataUtils.prototype.base64toString = function base64toString(input)
 {
   var output = "";
   var chr1, chr2, chr3 = "";
@@ -18223,7 +17619,7 @@ DataUtils.prototype.base64toString = function base64toString(input)
           "Valid base64 characters are A-Z, a-z, 0-9, '+', '/',and '='\n" +
           "Expect errors in decoding.");
   }
-  
+
   input = input.replace(/[^A-Za-z0-9\+\/\=]/g, "");
 
   do {
@@ -18254,7 +17650,7 @@ DataUtils.prototype.base64toString = function base64toString(input)
 /**
  * customBuf to Hex String
  */
-DataUtils.prototype.toHex = function(buffer) 
+DataUtils.prototype.toHex = function(buffer)
 {
   return buffer.toString('hex');
 };
@@ -18262,7 +17658,7 @@ DataUtils.prototype.toHex = function(buffer)
 /**
  * Raw string to hex string.
  */
-DataUtils.prototype.stringToHex = function(args) 
+DataUtils.prototype.stringToHex = function(args)
 {
   var ret = "";
   for (var i = 0; i < args.length; ++i) {
@@ -18275,15 +17671,15 @@ DataUtils.prototype.stringToHex = function(args)
 /**
  * customBuf to raw string.
  */
-DataUtils.prototype.toString = function(buffer) 
+DataUtils.prototype.toString = function(buffer)
 {
-  return buffer.toString();
+  return buffer.toString('binary');
 };
 
 /**
  * Hex String to customBuf.
  */
-DataUtils.prototype.toNumbers = function(str) 
+DataUtils.prototype.toNumbers = function(str)
 {
   return new customBuf(str, 'hex');
 };
@@ -18291,7 +17687,7 @@ DataUtils.prototype.toNumbers = function(str)
 /**
  * Hex String to raw string.
  */
-DataUtils.prototype.hexToRawString = function(str) 
+DataUtils.prototype.hexToRawString = function(str)
 {
   if (typeof str =='string') {
   var ret = "";
@@ -18305,15 +17701,30 @@ DataUtils.prototype.hexToRawString = function(str)
 /**
  * Raw String to customBuf.
  */
-DataUtils.prototype.toNumbersFromString = function(str) 
+DataUtils.prototype.toNumbersFromString = function(str)
 {
   return new customBuf(str, 'binary');
 };
 
 /**
  * Encode str as utf8 and return as customBuf.
+ * If value is a string, then interpret it as a raw string and convert to
+ * a Buffer. Otherwise assume it is a Buffer or array type and just return it.
+ * @param {string|any} value
+ * @returns {Buffer}
  */
-DataUtils.prototype.stringToUtf8Array = function(str) 
+DataUtils.prototype.toNumbersIfString = function(value)
+{
+  if (typeof value === 'string')
+    return new customBuf(value, 'binary');
+  else
+    return value;
+};
+
+/**
+ * Encode str as utf8 and return as Buffer.
+ */
+DataUtils.prototype.stringToUtf8Array = function(str)
 {
   return new customBuf(str, 'utf8');
 };
@@ -18321,23 +17732,23 @@ DataUtils.prototype.stringToUtf8Array = function(str)
 /**
  * arrays is an array of customBuf. Return a new customBuf which is the concatenation of all.
  */
-DataUtils.prototype.concatArrays = function(arrays) 
+DataUtils.prototype.concatArrays = function(arrays)
 {
   return customBuf.concat(arrays);
 };
- 
+
 // TODO: Take customBuf and use TextDecoder when available.
-DataUtils.prototype.decodeUtf8 = function(utftext) 
+DataUtils.prototype.decodeUtf8 = function(utftext)
 {
   var string = "";
   var i = 0;
   var c = 0;
     var c1 = 0;
     var c2 = 0;
- 
+
   while (i < utftext.length) {
     c = utftext.charCodeAt(i);
- 
+
     if (c < 128) {
       string += String.fromCharCode(c);
       i++;
@@ -18354,24 +17765,24 @@ DataUtils.prototype.decodeUtf8 = function(utftext)
       i += 3;
     }
   }
- 
+
   return string;
 };
 
 /**
  * Return true if a1 and a2 are the same length with equal elements.
  */
-DataUtils.prototype.arraysEqual = function(a1, a2) 
+DataUtils.prototype.arraysEqual = function(a1, a2)
 {
   // A simple sanity check that it is an array.
   if (!a1.slice)
     throw new Error("DataUtils.arraysEqual: a1 is not an array");
   if (!a2.slice)
     throw new Error("DataUtils.arraysEqual: a2 is not an array");
-    
+
   if (a1.length != a2.length)
     return false;
-  
+
   for (var i = 0; i < a1.length; ++i) {
     if (a1[i] != a2[i])
       return false;
@@ -18384,7 +17795,7 @@ DataUtils.prototype.arraysEqual = function(a1, a2)
  * Convert the big endian customBuf to an unsigned int.
  * Don't check for overflow.
  */
-DataUtils.prototype.bigEndianToUnsignedInt = function(bytes) 
+DataUtils.prototype.bigEndianToUnsignedInt = function(bytes)
 {
   var result = 0;
   for (var i = 0; i < bytes.length; ++i) {
@@ -18396,14 +17807,14 @@ DataUtils.prototype.bigEndianToUnsignedInt = function(bytes)
 
 /**
  * Convert the int value to a new big endian customBuf and return.
- * If value is 0 or negative, return new customBuf(0). 
+ * If value is 0 or negative, return new customBuf(0).
  */
-DataUtils.prototype.nonNegativeIntToBigEndian = function(value) 
+DataUtils.prototype.nonNegativeIntToBigEndian = function(value)
 {
   value = Math.round(value);
   if (value <= 0)
     return new customBuf(0);
-  
+
   // Assume value is not over 64 bits.
   var size = 8;
   var result = new customBuf(size);
@@ -18419,7 +17830,7 @@ DataUtils.prototype.nonNegativeIntToBigEndian = function(value)
 /**
  * Modify array to randomly shuffle the elements.
  */
-DataUtils.prototype.shuffle = function(array) 
+DataUtils.prototype.shuffle = function(array)
 {
   for (var i = array.length - 1; i >= 1; --i) {
     // j is from 0 to i.
@@ -18430,7 +17841,7 @@ DataUtils.prototype.shuffle = function(array)
   }
 };
 
-},{"../buffer.js":139}],147:[function(require,module,exports){
+},{"../buffer.js":112}],120:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -18455,7 +17866,7 @@ DecodingException.prototype.name = "DecodingException";
 
 exports.DecodingException = DecodingException;
 
-},{}],148:[function(require,module,exports){
+},{}],121:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -18471,14 +17882,14 @@ var LOG = require('../log.js').Log.LOG;
 
 /**
  * A ElementReader lets you call onReceivedData multiple times which uses a
- * BinaryXMLStructureDecoder or TlvStructureDecoder to detect the end of a 
- * binary XML or TLV element and calls elementListener.onReceivedElement(element) 
- * with the element.  This handles the case where a single call to 
+ * BinaryXMLStructureDecoder or TlvStructureDecoder to detect the end of a
+ * binary XML or TLV element and calls elementListener.onReceivedElement(element)
+ * with the element.  This handles the case where a single call to
  * onReceivedData may contain multiple elements.
  * @constructor
  * @param {{onReceivedElement:function}} elementListener
  */
-var ElementReader = function ElementReader(elementListener) 
+var ElementReader = function ElementReader(elementListener)
 {
   this.elementListener = elementListener;
   this.dataParts = [];
@@ -18489,7 +17900,7 @@ var ElementReader = function ElementReader(elementListener)
 
 exports.ElementReader = ElementReader;
 
-ElementReader.prototype.onReceivedData = function(/* customBuf */ data) 
+ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
 {
   // Process multiple objects in the data.
   while (true) {
@@ -18498,7 +17909,7 @@ ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
       if (data.length <= 0)
         // Wait for more data.
         return;
-      
+
       // The type codes for TLV Interest and Data packets are chosen to not
       //   conflict with the first byte of a binary XML packet, so we can
       //   just look at the first byte.
@@ -18523,7 +17934,7 @@ ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
       gotElementEnd = this.binaryXmlStructureDecoder.findElementEnd(data);
       offset = this.binaryXmlStructureDecoder.offset;
     }
-    
+
     if (gotElementEnd) {
       // Got the remainder of an object.  Report to the caller.
       this.dataParts.push(data.slice(0, offset));
@@ -18534,7 +17945,7 @@ ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
       } catch (ex) {
           console.log("ElementReader: ignoring exception from onReceivedElement: " , ex);
       }
-  
+
       // Need to read a new object.
       data = data.slice(offset, data.length);
       this.binaryXmlStructureDecoder = new BinaryXMLStructureDecoder();
@@ -18542,7 +17953,7 @@ ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
       if (data.length == 0)
         // No more data in the packet.
         return;
-      
+
       // else loop back to decode.
     }
     else {
@@ -18551,10 +17962,10 @@ ElementReader.prototype.onReceivedData = function(/* customBuf */ data)
       if (LOG > 3) console.log('Incomplete packet received. Length ' + data.length + '. Wait for more input.');
         return;
     }
-  }    
+  }
 };
 
-},{"../buffer.js":139,"../log.js":165,"./binary-xml-structure-decoder.js":144,"./data-utils.js":146,"./tlv/tlv-structure-decoder.js":154,"./tlv/tlv.js":155}],149:[function(require,module,exports){
+},{"../buffer.js":112,"../log.js":138,"./binary-xml-structure-decoder.js":117,"./data-utils.js":119,"./tlv/tlv-structure-decoder.js":127,"./tlv/tlv.js":128}],122:[function(require,module,exports){
 /**
  * This file contains utilities to help encode and decode NDN objects.
  * Copyright (C) 2013-2014 Regents of the University of California.
@@ -18794,7 +18205,7 @@ function encodeToBinaryInterest(interest) { return interest.wireEncode().buf(); 
  */
 function encodeToBinaryContentObject(data) { return data.wireEncode().buf(); }
 
-},{"../data.js":141,"../face-instance.js":158,"../forwarding-entry.js":160,"../interest.js":162,"../key-locator.js":163,"../key.js":164,"../log.js":165,"./binary-xml-decoder.js":142,"./binary-xml-encoder.js":143,"./data-utils.js":146,"./wire-format.js":156}],150:[function(require,module,exports){
+},{"../data.js":114,"../face-instance.js":131,"../forwarding-entry.js":133,"../interest.js":135,"../key-locator.js":136,"../key.js":137,"../log.js":138,"./binary-xml-decoder.js":115,"./binary-xml-encoder.js":116,"./data-utils.js":119,"./wire-format.js":129}],123:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -19034,7 +18445,8 @@ Tlv0_1a2WireFormat.encodeSelectors = function(interest, encoder)
     Tlv0_1a2WireFormat.encodeExclude(interest.getExclude(), encoder);
   
   if (interest.getKeyLocator().getType() != null)
-    Tlv0_1a2WireFormat.encodeKeyLocator(interest.getKeyLocator(), encoder);
+    Tlv0_1a2WireFormat.encodeKeyLocator
+      (Tlv.PublisherPublicKeyLocator, interest.getKeyLocator(), encoder);
   else {
     // There is no keyLocator. If there is a publisherPublicKeyDigest, then 
     //   encode as KEY_LOCATOR_DIGEST. (When we remove the deprecated 
@@ -19045,7 +18457,8 @@ Tlv0_1a2WireFormat.encodeSelectors = function(interest, encoder)
         (Tlv.KeyLocatorDigest, 
          interest.publisherPublicKeyDigest.publisherPublicKeyDigest);
       encoder.writeTypeAndLength
-        (Tlv.KeyLocator, encoder.getLength() - savePublisherPublicKeyDigestLength);
+        (Tlv.PublisherPublicKeyLocator, 
+         encoder.getLength() - savePublisherPublicKeyDigestLength);
     }
   }
   
@@ -19070,8 +18483,9 @@ Tlv0_1a2WireFormat.decodeSelectors = function(interest, decoder)
 
   // Initially set publisherPublicKeyDigest to none.
   interest.publisherPublicKeyDigest = null;
-  if (decoder.peekType(Tlv.KeyLocator, endOffset)) {
-    Tlv0_1a2WireFormat.decodeKeyLocator(interest.getKeyLocator(), decoder);
+  if (decoder.peekType(Tlv.PublisherPublicKeyLocator, endOffset)) {
+    Tlv0_1a2WireFormat.decodeKeyLocator
+      (Tlv.PublisherPublicKeyLocator, interest.getKeyLocator(), decoder);
     if (interest.getKeyLocator().getType() == KeyLocatorType.KEY_LOCATOR_DIGEST) {
       // For backwards compatibility, also set the publisherPublicKeyDigest.
       interest.publisherPublicKeyDigest = new PublisherPublicKeyDigest();
@@ -19130,7 +18544,7 @@ Tlv0_1a2WireFormat.decodeExclude = function(exclude, decoder)
   decoder.finishNestedTlvs(endOffset);
 };
 
-Tlv0_1a2WireFormat.encodeKeyLocator = function(keyLocator, encoder)
+Tlv0_1a2WireFormat.encodeKeyLocator = function(type, keyLocator, encoder)
 {
   var saveLength = encoder.getLength();
 
@@ -19145,12 +18559,13 @@ Tlv0_1a2WireFormat.encodeKeyLocator = function(keyLocator, encoder)
       throw new Error("Unrecognized KeyLocatorType " + keyLocator.getType());
   }
   
-  encoder.writeTypeAndLength(Tlv.KeyLocator, encoder.getLength() - saveLength);
+  encoder.writeTypeAndLength(type, encoder.getLength() - saveLength);
 };
 
-Tlv0_1a2WireFormat.decodeKeyLocator = function(keyLocator, decoder)
+Tlv0_1a2WireFormat.decodeKeyLocator = function
+  (expectedType, keyLocator, decoder)
 {
-  var endOffset = decoder.readNestedTlvsStart(Tlv.KeyLocator);
+  var endOffset = decoder.readNestedTlvsStart(expectedType);
 
   keyLocator.clear();
 
@@ -19189,7 +18604,7 @@ Tlv0_1a2WireFormat.encodeSignatureSha256WithRsaValue = function
   var saveLength = encoder.getLength();
 
   // Encode backwards.
-  Tlv0_1a2WireFormat.encodeKeyLocator(keyLocator, encoder);
+  Tlv0_1a2WireFormat.encodeKeyLocator(Tlv.KeyLocator, keyLocator, encoder);
   encoder.writeNonNegativeIntegerTlv
     (Tlv.SignatureType, Tlv.SignatureType_SignatureSha256WithRsa);
 
@@ -19211,7 +18626,7 @@ Tlv0_1a2WireFormat.decodeSignatureInfo = function(data, decoder)
       //   and set it, then data will have to copy all the fields.
       var signatureInfo = data.getSignature();
       Tlv0_1a2WireFormat.decodeKeyLocator
-        (signatureInfo.getKeyLocator(), decoder);
+        (Tlv.KeyLocator, signatureInfo.getKeyLocator(), decoder);
   }
   else
       throw new DecodingException
@@ -19273,7 +18688,7 @@ Tlv0_1a2WireFormat.decodeMetaInfo = function(metaInfo, decoder)
   decoder.finishNestedTlvs(endOffset);
 };
 
-},{"../crypto.js":139,"../exclude.js":157,"../key-locator.js":163,"../meta-info.js":166,"../signature.js":171,"../util/blob.js":173,"./decoding-exception.js":147,"./tlv/tlv-decoder.js":152,"./tlv/tlv-encoder.js":153,"./tlv/tlv.js":155,"./wire-format.js":156,"crypto":9}],151:[function(require,module,exports){
+},{"../crypto.js":112,"../exclude.js":130,"../key-locator.js":136,"../meta-info.js":139,"../signature.js":144,"../util/blob.js":146,"./decoding-exception.js":120,"./tlv/tlv-decoder.js":125,"./tlv/tlv-encoder.js":126,"./tlv/tlv.js":128,"./wire-format.js":129,"crypto":6}],124:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -19320,7 +18735,7 @@ TlvWireFormat.get = function()
 // This module will be loaded because WireFormat loads it.
 WireFormat.setDefaultWireFormat(TlvWireFormat.get());
 
-},{"./tlv-0_1a2-wire-format.js":150,"./wire-format.js":156}],152:[function(require,module,exports){
+},{"./tlv-0_1a2-wire-format.js":123,"./wire-format.js":129}],125:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -19645,7 +19060,7 @@ TlvDecoder.prototype.seek = function(offset)
   this.offset = offset;
 };  
 
-},{"../../buffer.js":139,"../decoding-exception.js":147}],153:[function(require,module,exports){
+},{"../../buffer.js":112,"../decoding-exception.js":120}],126:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -19852,7 +19267,7 @@ TlvEncoder.prototype.getOutput = function()
   return this.output.array.slice(this.output.array.length - this.length);
 };
 
-},{"../../buffer.js":139,"../../util/dynamic-buffer.js":174}],154:[function(require,module,exports){
+},{"../../buffer.js":112,"../../util/dynamic-buffer.js":147}],127:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -20062,7 +19477,7 @@ TlvStructureDecoder.prototype.seek = function(offset)
   this.offset = offset;
 };
 
-},{"../../buffer.js":139,"./tlv-decoder.js":152}],155:[function(require,module,exports){
+},{"../../buffer.js":112,"./tlv-decoder.js":125}],128:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -20121,7 +19536,7 @@ Tlv.StatusText =       140;
 Tlv.SignatureType_DigestSha256 = 0;
 Tlv.SignatureType_SignatureSha256WithRsa = 1;
 
-},{}],156:[function(require,module,exports){
+},{}],129:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -20221,7 +19636,7 @@ WireFormat.getDefaultWireFormat = function()
 // to avoid problems with cycles of require.
 var TlvWireFormat = require('./tlv-wire-format.js').TlvWireFormat;
 
-},{"../buffer.js":139,"./tlv-wire-format.js":151}],157:[function(require,module,exports){
+},{"../buffer.js":112,"./tlv-wire-format.js":124}],130:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -20455,7 +19870,7 @@ Exclude.compareComponents = function(component1, component2)
   return 0;
 };
 
-},{"./buffer.js":139,"./encoding/binary-xml-decoder.js":142,"./encoding/binary-xml-encoder.js":143,"./encoding/data-utils.js":146,"./name.js":167,"./util/ndn-protoco-id-tags.js":176}],158:[function(require,module,exports){
+},{"./buffer.js":112,"./encoding/binary-xml-decoder.js":115,"./encoding/binary-xml-encoder.js":116,"./encoding/data-utils.js":119,"./name.js":140,"./util/ndn-protoco-id-tags.js":149}],131:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -20569,7 +19984,7 @@ FaceInstance.prototype.getElementLabel = function()
 };
 
 
-},{"./publisher-public-key-digest.js":169,"./util/ndn-protoco-id-tags.js":176}],159:[function(require,module,exports){
+},{"./publisher-public-key-digest.js":142,"./util/ndn-protoco-id-tags.js":149}],132:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cherkaoui, Jeff Thompson <jefft0@remap.ucla.edu>, Wentao Shang
@@ -20594,6 +20009,7 @@ var BinaryXMLEncoder = require('./encoding/binary-xml-encoder.js').BinaryXMLEnco
 var NDNProtocolDTags = require('./util/ndn-protoco-id-tags.js').NDNProtocolDTags;
 var Key = require('./key.js').Key;
 var KeyLocatorType = require('./key-locator.js').KeyLocatorType;
+var globalKeyManager = require('./security/key-manager.js').globalKeyManager;
 var ForwardingFlags = require('./forwarding-flags.js').ForwardingFlags;
 var Closure = require('./closure.js').Closure;
 var UpcallInfo = require('./closure.js').UpcallInfo;
@@ -20617,11 +20033,11 @@ var LOG = require('./log.js').Log.LOG;
  *   verify: false // If false, don't verify and call upcall with Closure.UPCALL_CONTENT_UNVERIFIED.
  * }
  */
-var Face = function Face(settings) 
+var Face = function Face(settings)
 {
   if (!Face.supported)
     throw new Error("The necessary JavaScript support is not available on this platform.");
-    
+
   settings = (settings || {});
   // For the browser, browserify-tcp-transport.js replaces TcpTransport with WebSocketTransport.
   var getTransport = (settings.getTransport || function() { return new TcpTransport(); });
@@ -20646,16 +20062,16 @@ Face.CLOSED = 2;  // connection to ndnd closed
 /**
  * Return true if necessary JavaScript support is available, else log an error and return false.
  */
-Face.getSupported = function() 
+Face.getSupported = function()
 {
   try {
     var dummy = new customBuf(1).slice(0, 1);
-  } 
+  }
   catch (ex) {
     console.log("NDN not available: customBuf not supported. " + ex);
     return false;
   }
-    
+
   return true;
 };
 
@@ -20663,7 +20079,7 @@ Face.supported = Face.getSupported();
 
 Face.ndndIdFetcher = new Name('/%C1.M.S.localhost/%C1.M.SRV/ndnd/KEY');
 
-Face.prototype.createRoute = function(host, port) 
+Face.prototype.createRoute = function(host, port)
 {
   this.host=host;
   this.port=port;
@@ -20671,37 +20087,37 @@ Face.prototype.createRoute = function(host, port)
 
 Face.KeyStore = new Array();
 
-var KeyStoreEntry = function KeyStoreEntry(name, rsa, time) 
+var KeyStoreEntry = function KeyStoreEntry(name, rsa, time)
 {
   this.keyName = name;  // KeyName
   this.rsaKey = rsa;    // RSA key
   this.timeStamp = time;  // Time Stamp
 };
 
-Face.addKeyEntry = function(/* KeyStoreEntry */ keyEntry) 
+Face.addKeyEntry = function(/* KeyStoreEntry */ keyEntry)
 {
   var result = Face.getKeyByName(keyEntry.keyName);
-  if (result == null) 
+  if (result == null)
     Face.KeyStore.push(keyEntry);
   else
     result = keyEntry;
 };
 
-Face.getKeyByName = function(/* KeyName */ name) 
+Face.getKeyByName = function(/* KeyName */ name)
 {
   var result = null;
-  
+
   for (var i = 0; i < Face.KeyStore.length; i++) {
     if (Face.KeyStore[i].keyName.contentName.match(name.contentName)) {
       if (result == null || Face.KeyStore[i].keyName.contentName.components.length > result.keyName.contentName.components.length)
         result = Face.KeyStore[i];
     }
   }
-    
+
   return result;
 };
 
-Face.prototype.close = function() 
+Face.prototype.close = function()
 {
   if (this.readyStatus != Face.OPENED)
     throw new Error('Cannot close because Face connection is not opened.');
@@ -20716,7 +20132,7 @@ Face.PITTable = new Array();
 /**
  * @constructor
  */
-var PITEntry = function PITEntry(interest, closure) 
+var PITEntry = function PITEntry(interest, closure)
 {
   this.interest = interest;  // Interest
   this.closure = closure;    // Closure
@@ -20729,18 +20145,18 @@ var PITEntry = function PITEntry(interest, closure)
  */
 
 /**
- * Find all entries from Face.PITTable where the name conforms to the entry's 
+ * Find all entries from Face.PITTable where the name conforms to the entry's
  * interest selectors, remove the entries from the table, cancel their timeout
  * timers and return them.
  * @param {Name} name The name to find the interest for (from the incoming data
  * packet).
- * @returns {Array<PITEntry>} The matching entries from Face.PITTable, or [] if 
+ * @returns {Array<PITEntry>} The matching entries from Face.PITTable, or [] if
  * none are found.
  */
-Face.extractEntriesForExpressedInterest = function(name) 
+Face.extractEntriesForExpressedInterest = function(name)
 {
   var result = [];
-    
+
   // Go backwards through the list so we can erase entries.
   for (var i = Face.PITTable.length - 1; i >= 0; --i) {
     var entry = Face.PITTable[i];
@@ -20762,7 +20178,7 @@ Face.registeredPrefixTable = new Array();
 /**
  * @constructor
  */
-var RegisteredPrefix = function RegisteredPrefix(prefix, closure) 
+var RegisteredPrefix = function RegisteredPrefix(prefix, closure)
 {
   this.prefix = prefix;        // String
   this.closure = closure;  // Closure
@@ -20773,20 +20189,20 @@ var RegisteredPrefix = function RegisteredPrefix(prefix, closure)
  * @param {Name} name The name to find the PrefixEntry for (from the incoming interest packet).
  * @returns {object} The entry from Face.registeredPrefixTable, or 0 if not found.
  */
-function getEntryForRegisteredPrefix(name) 
+function getEntryForRegisteredPrefix(name)
 {
   var iResult = -1;
-  
+
   for (var i = 0; i < Face.registeredPrefixTable.length; i++) {
     if (LOG > 3) console.log("Registered prefix " + i + ": checking if " , Face.registeredPrefixTable[i].prefix , " matches " , name);
     if (Face.registeredPrefixTable[i].prefix.match(name)) {
-      if (iResult < 0 || 
+      if (iResult < 0 ||
           Face.registeredPrefixTable[i].prefix.size() > Face.registeredPrefixTable[iResult].prefix.size())
         // Update to the longer match.
         iResult = i;
     }
   }
-  
+
   if (iResult >= 0)
     return Face.registeredPrefixTable[iResult];
   else
@@ -20797,7 +20213,7 @@ function getEntryForRegisteredPrefix(name)
  * Return a function that selects a host at random from hostList and returns { host: host, port: port }.
  * If no more hosts remain, return null.
  */
-Face.makeShuffledGetHostAndPort = function(hostList, port) 
+Face.makeShuffledGetHostAndPort = function(hostList, port)
 {
   // Make a copy.
   hostList = hostList.slice(0, hostList.length);
@@ -20806,13 +20222,13 @@ Face.makeShuffledGetHostAndPort = function(hostList, port)
   return function() {
     if (hostList.length == 0)
       return null;
-      
+
     return { host: hostList.splice(0, 1)[0], port: port };
   };
 };
 
 /**
- * Send the interest through the transport, read the entire response and call onData. 
+ * Send the interest through the transport, read the entire response and call onData.
  * If the interest times out according to interest lifetime, call onTimeout (if not omitted).
  * There are two forms of expressInterest.  The first form takes the exact interest (including lifetime):
  * expressInterest(interest, onData [, onTimeout]).  The second form creates the interest from
@@ -20823,14 +20239,14 @@ Face.makeShuffledGetHostAndPort = function(hostList, port)
  * @param {function} onData When a matching data packet is received, this calls onData(interest, data) where:
  *   interest is the interest given to expressInterest,
  *   data is the received Data object.
- * @param {function} onTimeout (optional) If the interest times out according to the interest lifetime, 
+ * @param {function} onTimeout (optional) If the interest times out according to the interest lifetime,
  *   this calls onTimeout(interest) where:
  *   interest is the interest given to expressInterest.
  * @param {Name} name The Name for the interest. (only used for the second form of expressInterest).
- * @param {Interest} template (optional) If not omitted, copy the interest selectors from this Interest. 
+ * @param {Interest} template (optional) If not omitted, copy the interest selectors from this Interest.
  * If omitted, use a default interest lifetime. (only used for the second form of expressInterest).
  */
-Face.prototype.expressInterest = function(interestOrName, arg2, arg3, arg4) 
+Face.prototype.expressInterest = function(interestOrName, arg2, arg3, arg4)
 {
   // There are several overloaded versions of expressInterest, each shown inline below.
 
@@ -20838,13 +20254,26 @@ Face.prototype.expressInterest = function(interestOrName, arg2, arg3, arg4)
   // expressInterest(Name name, Closure closure,   Interest template); // deprecated
   if (arg2 && arg2.upcall && typeof arg2.upcall == 'function') {
     // Assume arg2 is the deprecated use with Closure.
-    if (arg3)
-      this.expressInterestWithClosure(interestOrName, arg2, arg3);
+    // The first argument is a name. Make the interest from the name and possible template.
+    interest = new Interest(interestOrName);
+    if (arg3) {
+      var template = arg3;
+      interest.minSuffixComponents = template.minSuffixComponents;
+      interest.maxSuffixComponents = template.maxSuffixComponents;
+      interest.publisherPublicKeyDigest = template.publisherPublicKeyDigest;
+      interest.exclude = template.exclude;
+      interest.childSelector = template.childSelector;
+      interest.answerOriginKind = template.answerOriginKind;
+      interest.scope = template.scope;
+      interest.interestLifetime = template.interestLifetime;
+    }
     else
-      this.expressInterestWithClosure(interestOrName, arg2);
+      interest.interestLifetime = 4000;   // default interest timeout value in milliseconds.
+
+    this.expressInterestWithClosure(interest, arg2);
     return;
   }
-  
+
   var interest;
   var onData;
   var onTimeout;
@@ -20859,8 +20288,8 @@ Face.prototype.expressInterest = function(interestOrName, arg2, arg3, arg4)
   else {
     // The first argument is a name. Make the interest from the name and possible template.
     interest = new Interest(interestOrName);
-    // expressInterest(Name name, Interest template, function onData); 
-    // expressInterest(Name name, Interest template, function onData, function onTimeout); 
+    // expressInterest(Name name, Interest template, function onData);
+    // expressInterest(Name name, Interest template, function onData, function onTimeout);
     if (arg2 && typeof arg2 == 'object' && arg2 instanceof Interest) {
       var template = arg2;
       interest.minSuffixComponents = template.minSuffixComponents;
@@ -20875,24 +20304,24 @@ Face.prototype.expressInterest = function(interestOrName, arg2, arg3, arg4)
       onData = arg3;
       onTimeout = (arg4 ? arg4 : function() {});
     }
-    // expressInterest(Name name, function onData); 
-    // expressInterest(Name name, function onData,   function onTimeout); 
+    // expressInterest(Name name, function onData);
+    // expressInterest(Name name, function onData,   function onTimeout);
     else {
       interest.interestLifetime = 4000;   // default interest timeout value in milliseconds.
       onData = arg2;
       onTimeout = (arg3 ? arg3 : function() {});
     }
   }
-  
+
   // Make a Closure from the callbacks so we can use expressInterestWithClosure.
   // TODO: Convert the PIT to use callbacks, not a closure.
-  this.expressInterestWithClosure(interest, new Face.CallbackClosure(onData, onTimeout));
+  this.expressInterestWithClosure(interest, new Face.CallbackClosure(onData, onTimeout), interest);
 }
 
 Face.CallbackClosure = function FaceCallbackClosure(onData, onTimeout, onInterest, prefix, transport) {
   // Inherit from Closure.
   Closure.call(this);
-  
+
   this.onData = onData;
   this.onTimeout = onTimeout;
   this.onInterest = onInterest;
@@ -20908,35 +20337,20 @@ Face.CallbackClosure.prototype.upcall = function(kind, upcallInfo) {
   else if (kind == Closure.UPCALL_INTEREST)
     // Note: We never return INTEREST_CONSUMED because onInterest will send the result to the transport.
     this.onInterest(this.prefix, upcallInfo.interest, this.transport)
-  
+
   return Closure.RESULT_OK;
 };
 
 /**
- * A private method to encode name as an Interest and send the it to host:port, read the entire response and call
+ * A private method to send the the interest to host:port, read the entire response and call
  * closure.upcall(Closure.UPCALL_CONTENT (or Closure.UPCALL_CONTENT_UNVERIFIED),
- *                 new UpcallInfo(this, interest, 0, data)). 
+ *                 new UpcallInfo(this, interest, 0, data)).
  * @deprecated Use expressInterest with callback functions, not Closure.
- * @param {Name} name Encode name as an Interest using the template (if supplied).
+ * @param {Interest} the interest, already processed with a template (if supplied).
  * @param {Closure} closure
- * @param {Interest} template If not null, use its attributes.
  */
-Face.prototype.expressInterestWithClosure = function(name, closure, template) 
+Face.prototype.expressInterestWithClosure = function(interest, closure)
 {
-  var interest = new Interest(name);
-  if (template != null) {
-    interest.minSuffixComponents = template.minSuffixComponents;
-    interest.maxSuffixComponents = template.maxSuffixComponents;
-    interest.publisherPublicKeyDigest = template.publisherPublicKeyDigest;
-    interest.exclude = template.exclude;
-    interest.childSelector = template.childSelector;
-    interest.answerOriginKind = template.answerOriginKind;
-    interest.scope = template.scope;
-    interest.interestLifetime = template.interestLifetime;
-  }
-  else
-    interest.interestLifetime = 4000;   // default interest timeout value in milliseconds.
-  
   if (this.host == null || this.port == null) {
     if (this.getHostAndPort == null)
       console.log('ERROR: host OR port NOT SET');
@@ -20954,7 +20368,7 @@ Face.prototype.expressInterestWithClosure = function(name, closure, template)
  *   this.transport.connect to change the connection (or connect for the first time).
  * Then call expressInterestHelper.
  */
-Face.prototype.reconnectAndExpressInterest = function(interest, closure) 
+Face.prototype.reconnectAndExpressInterest = function(interest, closure)
 {
   if (this.transport.connectedHost != this.host || this.transport.connectedPort != this.port) {
     var thisNDN = this;
@@ -20969,10 +20383,10 @@ Face.prototype.reconnectAndExpressInterest = function(interest, closure)
  * Do the work of reconnectAndExpressInterest once we know we are connected.  Set the PITTable and call
  *   this.transport.send to send the interest.
  */
-Face.prototype.expressInterestHelper = function(interest, closure) 
+Face.prototype.expressInterestHelper = function(interest, closure)
 {
   var binaryInterest = interest.wireEncode();
-  var thisNDN = this;    
+  var thisNDN = this;
   //TODO: check local content store first
   if (closure != null) {
     var pitEntry = new PITEntry(interest, closure);
@@ -20984,14 +20398,14 @@ Face.prototype.expressInterestHelper = function(interest, closure)
     var timeoutMilliseconds = (interest.interestLifetime || 4000);
     var timeoutCallback = function() {
       if (LOG > 1) console.log("Interest time out: " + interest.name.toUri());
-        
+
       // Remove PIT entry from Face.PITTable, even if we add it again later to re-express
       //   the interest because we don't want to match it in the mean time.
       // TODO: Make this a thread-safe operation on the global PITTable.
       var index = Face.PITTable.indexOf(pitEntry);
-      if (index >= 0) 
+      if (index >= 0)
         Face.PITTable.splice(index, 1);
-        
+
       // Raise closure callback
       if (closure.upcall(Closure.UPCALL_INTEREST_TIMED_OUT, new UpcallInfo(thisNDN, interest, 0, null)) == Closure.RESULT_REEXPRESS) {
         if (LOG > 1) console.log("Re-express interest: " + interest.name.toUri());
@@ -21000,7 +20414,7 @@ Face.prototype.expressInterestHelper = function(interest, closure)
         thisNDN.transport.send(binaryInterest.buf());
       }
     };
-  
+
     pitEntry.timerID = setTimeout(timeoutCallback, timeoutMilliseconds);
   }
 
@@ -21013,18 +20427,18 @@ Face.prototype.expressInterestHelper = function(interest, closure)
  * registerPrefix(name, onInterest, onRegisterFailed [, flags]).
  * This also supports the deprecated form registerPrefix(name, closure [, intFlags]), but you should use the main form.
  * @param {Name} prefix The Name prefix.
- * @param {function} onInterest When an interest is received which matches the name prefix, this calls 
+ * @param {function} onInterest When an interest is received which matches the name prefix, this calls
  * onInterest(prefix, interest, transport) where:
  *   prefix is the prefix given to registerPrefix.
  *   interest is the received interest.
  *   transport The Transport with the connection which received the interest. You must encode a signed Data packet and send it using transport.send().
- * @param {function} onRegisterFailed If failed to retrieve the connected hub's ID or failed to register the prefix, 
+ * @param {function} onRegisterFailed If failed to retrieve the connected hub's ID or failed to register the prefix,
  * this calls onRegisterFailed(prefix) where:
  *   prefix is the prefix given to registerPrefix.
- * @param {ForwardingFlags} flags (optional) The flags for finer control of which interests are forward to the application.  
+ * @param {ForwardingFlags} flags (optional) The flags for finer control of which interests are forward to the application.
  * If omitted, use the default flags defined by the default ForwardingFlags constructor.
  */
-Face.prototype.registerPrefix = function(prefix, arg2, arg3, arg4) 
+Face.prototype.registerPrefix = function(prefix, arg2, arg3, arg4)
 {
   // There are several overloaded versions of registerPrefix, each shown inline below.
 
@@ -21044,21 +20458,21 @@ Face.prototype.registerPrefix = function(prefix, arg2, arg3, arg4)
   var onInterest = arg2;
   var onRegisterFailed = (arg3 ? arg3 : function() {});
   var intFlags = (arg4 ? arg4.getForwardingEntryFlags() : new ForwardingFlags().getForwardingEntryFlags());
-  this.registerPrefixWithClosure(prefix, new Face.CallbackClosure(null, null, onInterest, prefix, this.transport), 
+  this.registerPrefixWithClosure(prefix, new Face.CallbackClosure(null, null, onInterest, prefix, this.transport),
                                  intFlags, onRegisterFailed);
 }
 
 /**
  * A private method to register the prefix with the host, receive the data and call
- * closure.upcall(Closure.UPCALL_INTEREST, new UpcallInfo(this, interest, 0, null)). 
+ * closure.upcall(Closure.UPCALL_INTEREST, new UpcallInfo(this, interest, 0, null)).
  * @deprecated Use registerPrefix with callback functions, not Closure.
  * @param {Name} prefix
  * @param {Closure} closure
  * @param {number} intFlags
- * @param {function} (optional) If called from the non-deprecated registerPrefix, call onRegisterFailed(prefix) 
+ * @param {function} (optional) If called from the non-deprecated registerPrefix, call onRegisterFailed(prefix)
  * if registration fails.
  */
-Face.prototype.registerPrefixWithClosure = function(prefix, closure, intFlags, onRegisterFailed) 
+Face.prototype.registerPrefixWithClosure = function(prefix, closure, intFlags, onRegisterFailed)
 {
   intFlags = intFlags | 3;
   var thisNDN = this;
@@ -21071,7 +20485,7 @@ Face.prototype.registerPrefixWithClosure = function(prefix, closure, intFlags, o
       thisNDN.reconnectAndExpressInterest
         (interest, new Face.FetchNdndidClosure(thisNDN, prefix, closure, intFlags, onRegisterFailed));
     }
-    else  
+    else
       thisNDN.registerPrefixHelper(prefix, closure, flags, onRegisterFailed);
   };
 
@@ -21089,11 +20503,11 @@ Face.prototype.registerPrefixWithClosure = function(prefix, closure, intFlags, o
  * This is a closure to receive the Data for Face.ndndIdFetcher and call
  *   registerPrefixHelper(prefix, callerClosure, flags).
  */
-Face.FetchNdndidClosure = function FetchNdndidClosure(face, prefix, callerClosure, flags, onRegisterFailed) 
+Face.FetchNdndidClosure = function FetchNdndidClosure(face, prefix, callerClosure, flags, onRegisterFailed)
 {
   // Inherit from Closure.
   Closure.call(this);
-    
+
   this.face = face;
   this.prefix = prefix;
   this.callerClosure = callerClosure;
@@ -21101,7 +20515,7 @@ Face.FetchNdndidClosure = function FetchNdndidClosure(face, prefix, callerClosur
   this.onRegisterFailed = onRegisterFailed;
 };
 
-Face.FetchNdndidClosure.prototype.upcall = function(kind, upcallInfo) 
+Face.FetchNdndidClosure.prototype.upcall = function(kind, upcallInfo)
 {
   if (kind == Closure.UPCALL_INTEREST_TIMED_OUT) {
     console.log("Timeout while requesting the ndndid.  Cannot registerPrefix for " + this.prefix.toUri() + " .");
@@ -21113,35 +20527,35 @@ Face.FetchNdndidClosure.prototype.upcall = function(kind, upcallInfo)
         kind == Closure.UPCALL_CONTENT_UNVERIFIED))
     // The upcall is not for us.  Don't expect this to happen.
     return Closure.RESULT_ERR;
-       
+
   if (LOG > 3) console.log('Got ndndid from ndnd.');
   // Get the digest of the public key in the data packet content.
   var hash = require("./crypto.js").createHash('sha256');
   hash.update(upcallInfo.data.getContent());
-  this.face.ndndid = new customBuf(hash.digest());
+  this.face.ndndid = new customBuf(DataUtils.toNumbersIfString(hash.digest()));
   if (LOG > 3) console.log(this.face.ndndid);
-  
+
   this.face.registerPrefixHelper
     (this.prefix, this.callerClosure, this.flags, this.onRegisterFailed);
-    
+
   return Closure.RESULT_OK;
 };
 /**
- * This is a closure to receive the response Data packet from the register 
+ * This is a closure to receive the response Data packet from the register
  * prefix interest sent to the connected NDN hub. If this gets a bad response
  * or a timeout, call onRegisterFailed.
  */
 Face.RegisterResponseClosure = function RegisterResponseClosure
-  (prefix, onRegisterFailed) 
+  (prefix, onRegisterFailed)
 {
   // Inherit from Closure.
   Closure.call(this);
-    
+
   this.prefix = prefix;
   this.onRegisterFailed = onRegisterFailed;
 };
 
-Face.RegisterResponseClosure.prototype.upcall = function(kind, upcallInfo) 
+Face.RegisterResponseClosure.prototype.upcall = function(kind, upcallInfo)
 {
   if (kind == Closure.UPCALL_INTEREST_TIMED_OUT) {
     if (this.onRegisterFailed)
@@ -21152,7 +20566,7 @@ Face.RegisterResponseClosure.prototype.upcall = function(kind, upcallInfo)
         kind == Closure.UPCALL_CONTENT_UNVERIFIED))
     // The upcall is not for us.  Don't expect this to happen.
     return Closure.RESULT_ERR;
-       
+
   var expectedName = new Name("/ndnx/.../selfreg");
   // Got a response. Do a quick check of expected name components.
   if (upcallInfo.data.getName().size() < 4 ||
@@ -21161,8 +20575,8 @@ Face.RegisterResponseClosure.prototype.upcall = function(kind, upcallInfo)
     this.onRegisterFailed(this.prefix);
     return;
   }
-  
-  // Otherwise, silently succeed.  
+
+  // Otherwise, silently succeed.
   return Closure.RESULT_OK;
 };
 
@@ -21170,24 +20584,27 @@ Face.RegisterResponseClosure.prototype.upcall = function(kind, upcallInfo)
  * Do the work of registerPrefix once we know we are connected with a ndndid.
  */
 Face.prototype.registerPrefixHelper = function
-  (prefix, closure, flags, onRegisterFailed) 
+  (prefix, closure, flags, onRegisterFailed)
 {
   var fe = new ForwardingEntry('selfreg', prefix, null, null, flags, null);
-    
+
   // Always encode as BinaryXml until we support TLV for ForwardingEntry.
   var encoder = new BinaryXMLEncoder();
   fe.to_ndnb(encoder);
   var bytes = encoder.getReducedOstream();
-    
-  var si = new MetaInfo();
-  si.setFields();
-    
-  // Set the name to a random value so that each request is unique.
-  var data = new Data(new Name().append(require("crypto").randomBytes(4)), si, bytes); 
+
+  var metaInfo = new MetaInfo();
+  metaInfo.setFields();
+  // Since we encode the register prefix message as BinaryXml, use the full
+  //   public key in the key locator to make the legacy NDNx happy.
+  metaInfo.locator.setType(KeyLocatorType.KEY);
+  metaInfo.locator.setKeyData(globalKeyManager.getKey().publicToDER());
+
+  var data = new Data(new Name(), metaInfo, bytes);
   // Always encode as BinaryXml until we support TLV for ForwardingEntry.
   data.sign(BinaryXmlWireFormat.get());
   var coBinary = data.wireEncode(BinaryXmlWireFormat.get());;
-    
+
   var nodename = this.ndndid;
   var interestName = new Name(['ndnx', nodename, 'selfreg', coBinary]);
 
@@ -21195,9 +20612,9 @@ Face.prototype.registerPrefixHelper = function
   interest.setInterestLifetimeMilliseconds(4000.0);
   interest.setScope(1);
   if (LOG > 3) console.log('Send Interest registration packet.');
-      
+
   Face.registeredPrefixTable.push(new RegisteredPrefix(prefix, closure));
-    
+
   this.reconnectAndExpressInterest
     (interest, new Face.RegisterResponseClosure(prefix, onRegisterFailed));
 };
@@ -21206,7 +20623,7 @@ Face.prototype.registerPrefixHelper = function
  * This is called when an entire binary XML element is received, such as a Data or Interest.
  * Look up in the PITTable and call the closure callback.
  */
-Face.prototype.onReceivedElement = function(element) 
+Face.prototype.onReceivedElement = function(element)
 {
   if (LOG > 3) console.log('Complete element received. Length ' + element.length + '. Start decoding.');
   // First, decode as Interest or Data.
@@ -21217,7 +20634,7 @@ Face.prototype.onReceivedElement = function(element)
   //   just look at the first byte.
   if (element[0] == Tlv.Interest || element[0] == Tlv.Data) {
     if (LOG > 3) console.log('Detected Tlv element', element, TlvWireFormat.get())
-    var decoder = new TlvDecoder(element);  
+    var decoder = new TlvDecoder(element);
     if (decoder.peekType(Tlv.Interest, element.length)) {
       interest = new Interest();
       interest.wireDecode(element, TlvWireFormat.get());
@@ -21243,90 +20660,89 @@ Face.prototype.onReceivedElement = function(element)
 
   // Now process as Interest or Data.
   if (interest !== null) {
-    if (LOG > 3) console.log('Interest packet received.', interest);
-        setTimeout(function(){console.log(interest)}, 300)
+    if (LOG > 3) console.log('Interest packet received.');
     var entry = getEntryForRegisteredPrefix(interest.name);
     if (entry != null) {
       if (LOG > 3) console.log("Found registered prefix for " + interest.name.toUri());
       var info = new UpcallInfo(this, interest, 0, null);
       var ret = entry.closure.upcall(Closure.UPCALL_INTEREST, info);
-      if (ret == Closure.RESULT_INTEREST_CONSUMED && info.data != null) 
+      if (ret == Closure.RESULT_INTEREST_CONSUMED && info.data != null)
         this.transport.send(info.data.wireEncode().buf());
-    }        
-  } 
+    }
+  }
   else if (data !== null) {
     if (LOG > 3) console.log('Data packet received.');
-        
+
     var pendingInterests = Face.extractEntriesForExpressedInterest(data.name);
     // Process each matching PIT entry (if any).
     for (var i = 0; i < pendingInterests.length; ++i) {
       var pitEntry = pendingInterests[i];
       var currentClosure = pitEntry.closure;
-                    
+
       if (this.verify == false) {
         // Pass content up without verifying the signature
         currentClosure.upcall(Closure.UPCALL_CONTENT_UNVERIFIED, new UpcallInfo(this, pitEntry.interest, 0, data));
         continue;
       }
-        
+
       // Key verification
-            
+
       // Recursive key fetching & verification closure
       var KeyFetchClosure = function KeyFetchClosure(content, closure, key, sig, wit) {
         this.data = content;  // unverified data packet object
         this.closure = closure;  // closure corresponding to the data
         this.keyName = key;  // name of current key to be fetched
-            
+
         Closure.call(this);
       };
-            
+
       var thisNDN = this;
       KeyFetchClosure.prototype.upcall = function(kind, upcallInfo) {
         if (kind == Closure.UPCALL_INTEREST_TIMED_OUT) {
           console.log("In KeyFetchClosure.upcall: interest time out.");
           console.log(this.keyName.contentName.toUri());
-        } 
+        }
         else if (kind == Closure.UPCALL_CONTENT) {
           var rsakey = new Key();
           rsakey.readDerPublicKey(upcallInfo.data.content);
           var verified = data.verify(rsakey);
-                
+
           var flag = (verified == true) ? Closure.UPCALL_CONTENT : Closure.UPCALL_CONTENT_BAD;
           this.closure.upcall(flag, new UpcallInfo(thisNDN, null, 0, this.data));
-                
+
           // Store key in cache
           var keyEntry = new KeyStoreEntry(keylocator.keyName, rsakey, new Date().getTime());
           Face.addKeyEntry(keyEntry);
-        } 
+        }
         else if (kind == Closure.UPCALL_CONTENT_BAD)
           console.log("In KeyFetchClosure.upcall: signature verification failed");
       };
-            
+
       if (data.signedInfo && data.signedInfo.locator && data.signature) {
         if (LOG > 3) console.log("Key verification...");
         var sigHex = DataUtils.toHex(data.signature.signature).toLowerCase();
-              
+
         var wit = null;
         if (data.signature.witness != null)
             //SWT: deprecate support for Witness decoding and Merkle hash tree verification
             currentClosure.upcall(Closure.UPCALL_CONTENT_BAD, new UpcallInfo(this, pitEntry.interest, 0, data));
-          
+
         var keylocator = data.signedInfo.locator;
         if (keylocator.type == KeyLocatorType.KEYNAME) {
           if (LOG > 3) console.log("KeyLocator contains KEYNAME");
-                
+
           if (keylocator.keyName.contentName.match(data.name)) {
             if (LOG > 3) console.log("Content is key itself");
-                  
+
             var rsakey = new Key();
             rsakey.readDerPublicKey(data.content);
             var verified = data.verify(rsakey);
             var flag = (verified == true) ? Closure.UPCALL_CONTENT : Closure.UPCALL_CONTENT_BAD;
-              
+
             currentClosure.upcall(flag, new UpcallInfo(this, pitEntry.interest, 0, data));
 
             // SWT: We don't need to store key here since the same key will be stored again in the closure.
-          } 
+          }
           else {
             // Check local key store
             var keyEntry = Face.getKeyByName(keylocator.keyName);
@@ -21339,7 +20755,7 @@ Face.prototype.onReceivedElement = function(element)
 
               // Raise callback
               currentClosure.upcall(flag, new UpcallInfo(this, pitEntry.interest, 0, data));
-            } 
+            }
             else {
               // Not found, fetch now
               if (LOG > 3) console.log("Fetch key according to keylocator");
@@ -21348,37 +20764,37 @@ Face.prototype.onReceivedElement = function(element)
               this.expressInterest(keylocator.keyName.contentName.getPrefix(4), nextClosure);
             }
           }
-        } 
+        }
         else if (keylocator.type == KeyLocatorType.KEY) {
           if (LOG > 3) console.log("Keylocator contains KEY");
-                
+
           var rsakey = new Key();
           rsakey.readDerPublicKey(keylocator.publicKey);
           var verified = data.verify(rsakey);
-              
+
           var flag = (verified == true) ? Closure.UPCALL_CONTENT : Closure.UPCALL_CONTENT_BAD;
           // Raise callback
           currentClosure.upcall(Closure.UPCALL_CONTENT, new UpcallInfo(this, pitEntry.interest, 0, data));
 
           // Since KeyLocator does not contain key name for this key,
           // we have no way to store it as a key entry in KeyStore.
-        } 
+        }
         else {
           var cert = keylocator.certificate;
           console.log("KeyLocator contains CERT");
-          console.log(cert);                
+          console.log(cert);
           // TODO: verify certificate
         }
       }
     }
-  } 
+  }
 };
 
 /**
  * Assume this.getHostAndPort is not null.  This is called when this.host is null or its host
  *   is not alive.  Get a host and port, connect, then execute onConnected().
  */
-Face.prototype.connectAndExecute = function(onConnected) 
+Face.prototype.connectAndExecute = function(onConnected)
 {
   var hostAndPort = this.getHostAndPort();
   if (hostAndPort == null) {
@@ -21391,14 +20807,14 @@ Face.prototype.connectAndExecute = function(onConnected)
     console.log('ERROR: The host returned by getHostAndPort is not alive: ' + this.host + ":" + this.port);
     return;
   }
-        
+
   this.host = hostAndPort.host;
-  this.port = hostAndPort.port;   
+  this.port = hostAndPort.port;
   if (LOG>0) console.log("connectAndExecute: trying host from getHostAndPort: " + this.host);
-    
+
   // Fetch any content.
   var interest = new Interest(new Name("/"));
-  interest.interestLifetime = 4000; // milliseconds    
+  interest.interestLifetime = 4000; // milliseconds
 
   var thisNDN = this;
   var timerID = setTimeout(function() {
@@ -21406,36 +20822,36 @@ Face.prototype.connectAndExecute = function(onConnected)
       // Try again.
       thisNDN.connectAndExecute(onConnected);
   }, 3000);
-  
+
   this.reconnectAndExpressInterest(interest, new Face.ConnectClosure(this, onConnected, timerID));
 };
 
 /**
  * This is called by the Transport when the connection is closed by the remote host.
  */
-Face.prototype.closeByTransport = function() 
+Face.prototype.closeByTransport = function()
 {
   this.readyStatus = Face.CLOSED;
   this.onclose();
 };
 
-Face.ConnectClosure = function ConnectClosure(face, onConnected, timerID) 
+Face.ConnectClosure = function ConnectClosure(face, onConnected, timerID)
 {
   // Inherit from Closure.
   Closure.call(this);
-    
+
   this.face = face;
   this.onConnected = onConnected;
   this.timerID = timerID;
 };
 
-Face.ConnectClosure.prototype.upcall = function(kind, upcallInfo) 
+Face.ConnectClosure.prototype.upcall = function(kind, upcallInfo)
 {
   if (!(kind == Closure.UPCALL_CONTENT ||
         kind == Closure.UPCALL_CONTENT_UNVERIFIED))
     // The upcall is not for us.
     return Closure.RESULT_ERR;
-        
+
   // The host is alive, so cancel the timeout and continue with onConnected().
   clearTimeout(this.timerID);
 
@@ -21452,13 +20868,13 @@ Face.ConnectClosure.prototype.upcall = function(kind, upcallInfo)
 /**
  * @deprecated Use new Face.
  */
-var NDN = function NDN(settings) 
+var NDN = function NDN(settings)
 {
   // Call the base constructor.
-  Face.call(this, settings); 
+  Face.call(this, settings);
 }
 
-// Use dummy functions so that the Face constructor will not try to set its own defaults.                                      
+// Use dummy functions so that the Face constructor will not try to set its own defaults.
 NDN.prototype = new Face({ getTransport: function(){}, getHostAndPort: function(){} });
 
 exports.NDN = NDN;
@@ -21468,7 +20884,7 @@ NDN.UNOPEN = Face.UNOPEN;
 NDN.OPENED = Face.OPENED;
 NDN.CLOSED = Face.CLOSED;
 
-},{"./buffer.js":139,"./closure.js":140,"./crypto.js":139,"./data.js":141,"./encoding/binary-xml-decoder.js":142,"./encoding/binary-xml-encoder.js":143,"./encoding/binary-xml-wire-format.js":145,"./encoding/data-utils.js":146,"./encoding/tlv-wire-format.js":151,"./encoding/tlv/tlv-decoder.js":152,"./encoding/tlv/tlv.js":155,"./forwarding-entry.js":160,"./forwarding-flags.js":161,"./interest.js":162,"./key-locator.js":163,"./key.js":164,"./log.js":165,"./meta-info.js":166,"./name.js":167,"./transport/tcp-transport.js":172,"./util/ndn-protoco-id-tags.js":176,"crypto":9}],160:[function(require,module,exports){
+},{"./buffer.js":112,"./closure.js":113,"./crypto.js":112,"./data.js":114,"./encoding/binary-xml-decoder.js":115,"./encoding/binary-xml-encoder.js":116,"./encoding/binary-xml-wire-format.js":118,"./encoding/data-utils.js":119,"./encoding/tlv-wire-format.js":124,"./encoding/tlv/tlv-decoder.js":125,"./encoding/tlv/tlv.js":128,"./forwarding-entry.js":133,"./forwarding-flags.js":134,"./interest.js":135,"./key-locator.js":136,"./key.js":137,"./log.js":138,"./meta-info.js":139,"./name.js":140,"./security/key-manager.js":143,"./transport/tcp-transport.js":111,"./util/ndn-protoco-id-tags.js":149}],133:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -21560,7 +20976,7 @@ ForwardingEntry.prototype.to_ndnb = function(
 
 ForwardingEntry.prototype.getElementLabel = function() { return NDNProtocolDTags.ForwardingEntry; }
 
-},{"./name.js":167,"./publisher-public-key-digest.js":169,"./util/ndn-protoco-id-tags.js":176}],161:[function(require,module,exports){
+},{"./name.js":140,"./publisher-public-key-digest.js":142,"./util/ndn-protoco-id-tags.js":149}],134:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -21729,7 +21145,7 @@ ForwardingFlags.prototype.setTap = function(value) { this.tap = value; };
  */  
 ForwardingFlags.prototype.setCaptureOk = function(value) { this.captureOk = value; };
 
-},{"./forwarding-entry.js":160}],162:[function(require,module,exports){
+},{"./forwarding-entry.js":133}],135:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -22180,7 +21596,7 @@ Interest.prototype.decode = function(input, wireFormat)
   this.wireDecode(input, BinaryXmlWireFormat.get())
 };
 
-},{"./buffer.js":139,"./encoding/binary-xml-wire-format.js":145,"./encoding/wire-format.js":156,"./exclude.js":157,"./key-locator.js":163,"./log.js":165,"./name.js":167,"./publisher-public-key-digest.js":169,"./util/blob.js":173}],163:[function(require,module,exports){
+},{"./buffer.js":112,"./encoding/binary-xml-wire-format.js":118,"./encoding/wire-format.js":129,"./exclude.js":130,"./key-locator.js":136,"./log.js":138,"./name.js":140,"./publisher-public-key-digest.js":142,"./util/blob.js":146}],136:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -22467,14 +21883,16 @@ KeyName.prototype.to_ndnb = function(encoder)
 KeyName.prototype.getElementLabel = function() { return NDNProtocolDTags.KeyName; };
 
 
-},{"./buffer.js":139,"./log.js":165,"./name.js":167,"./publisher-id.js":168,"./util/ndn-protoco-id-tags.js":176}],164:[function(require,module,exports){
+},{"./buffer.js":112,"./log.js":138,"./name.js":140,"./publisher-id.js":141,"./util/ndn-protoco-id-tags.js":149}],137:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
  * See COPYING for copyright and distribution information.
  * This class represents Key Objects
  */
+
 var customBuf = require('./buffer.js').Buffer
+var DataUtils = require('./encoding/data-utils.js').DataUtils;
 var LOG = require('./log.js').Log.LOG;
 
 /**
@@ -22483,7 +21901,7 @@ var LOG = require('./log.js').Log.LOG;
 /**
  * Key
  */
-var Key = function Key() 
+var Key = function Key()
 {
   this.publicKeyDer = null;     // customBuf
   this.publicKeyDigest = null;  // customBuf
@@ -22498,12 +21916,12 @@ exports.Key = Key;
  * TODO: generateRSA()
  */
 
-Key.prototype.publicToDER = function() 
+Key.prototype.publicToDER = function()
 {
   return this.publicKeyDer;  // customBuf
 };
 
-Key.prototype.privateToDER = function() 
+Key.prototype.privateToDER = function()
 {
   // Remove the '-----XXX-----' from the beginning and the end of the key
   // and also remove any \n in the key string
@@ -22511,28 +21929,28 @@ Key.prototype.privateToDER = function()
   priKey = "";
   for (var i = 1; i < lines.length - 1; i++)
     priKey += lines[i];
-  
-  return new customBuf(priKey, 'base64');    
+
+  return new customBuf(priKey, 'base64');
 };
 
-Key.prototype.publicToPEM = function() 
+Key.prototype.publicToPEM = function()
 {
   return this.publicKeyPem;
 };
 
-Key.prototype.privateToPEM = function() 
+Key.prototype.privateToPEM = function()
 {
   return this.privateKeyPem;
 };
 
-Key.prototype.getKeyID = function() 
+Key.prototype.getKeyID = function()
 {
   return this.publicKeyDigest;
 };
 
 exports.Key = Key;
 
-Key.prototype.readDerPublicKey = function(/*Buffer*/pub_der) 
+Key.prototype.readDerPublicKey = function(/*Buffer*/pub_der)
 {
   if (LOG > 4) console.log("Encode DER public key:\n" + pub_der.toString('hex'));
 
@@ -22540,9 +21958,8 @@ Key.prototype.readDerPublicKey = function(/*Buffer*/pub_der)
 
   var hash = require("./crypto.js").createHash('sha256');
   hash.update(this.publicKeyDer);
-  this.publicKeyDigest = new customBuf(hash.digest());
-    
-  var keyStr = pub_der.toString('base64'); 
+  this.publicKeyDigest = new customBuf(DataUtils.toNumbersIfString(hash.digest()));
+  var keyStr = pub_der.toString('base64');
   var keyPem = "-----BEGIN PUBLIC KEY-----\n";
   for (var i = 0; i < keyStr.length; i += 64)
   keyPem += (keyStr.substr(i, 64) + "\n");
@@ -22556,7 +21973,7 @@ Key.prototype.readDerPublicKey = function(/*Buffer*/pub_der)
  * Load RSA key pair from PEM-encoded strings.
  * Will throw an Error if both 'pub' and 'pri' are null.
  */
-Key.prototype.fromPemString = function(pub, pri) 
+Key.prototype.fromPemString = function(pub, pri)
 {
   if (pub == null && pri == null)
     throw new Error('Cannot create Key object if both public and private PEM string is empty.');
@@ -22565,7 +21982,7 @@ Key.prototype.fromPemString = function(pub, pri)
   if (pub != null) {
     this.publicKeyPem = pub;
     if (LOG > 4) console.log("Key.publicKeyPem: \n" + this.publicKeyPem);
-  
+
     // Remove the '-----XXX-----' from the beginning and the end of the public key
     // and also remove any \n in the public key string
     var lines = pub.split('\n');
@@ -22574,13 +21991,13 @@ Key.prototype.fromPemString = function(pub, pri)
       pub += lines[i];
     this.publicKeyDer = new customBuf(pub, 'base64');
     if (LOG > 4) console.log("Key.publicKeyDer: \n" + this.publicKeyDer.toString('hex'));
-  
+
     var hash = require("./crypto.js").createHash('sha256');
     hash.update(this.publicKeyDer);
-    this.publicKeyDigest = new customBuf(hash.digest());
+    this.publicKeyDigest = new customBuf(DataUtils.toNumbersIfString(hash.digest()));
     if (LOG > 4) console.log("Key.publicKeyDigest: \n" + this.publicKeyDigest.toString('hex'));
   }
-    
+
   // Read private key
   if (pri != null) {
     this.privateKeyPem = pri;
@@ -22597,14 +22014,14 @@ Key.prototype.fromPem = Key.prototype.fromPemString;
  *   pri: the PEM string for the private key
  * Will throw an Error if both obj.pub and obj.pri are null.
  */
-Key.createFromPEM = function(obj) 
+Key.createFromPEM = function(obj)
 {
     var key = new Key();
     key.fromPemString(obj.pub, obj.pri);
     return key;
 };
 
-},{"./buffer.js":139,"./crypto.js":139,"./log.js":165}],165:[function(require,module,exports){
+},{"./buffer.js":112,"./crypto.js":112,"./encoding/data-utils.js":119,"./log.js":138}],138:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -22614,19 +22031,19 @@ Key.createFromPEM = function(obj)
 /**
  * The Log class holds the global static variable LOG.
  */
-var Log = function Log() 
+var Log = function Log()
 {
 }
 
 exports.Log = Log;
 
 /**
- * LOG is the level for logging debugging statements.  0 means no log messages. 
+ * LOG is the level for logging debugging statements.  0 means no log messages.
  * @type Number
  */
-Log.LOG = 5;
+Log.LOG = 0;
 
-},{}],166:[function(require,module,exports){
+},{}],139:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -22918,7 +22335,7 @@ SignedInfo.prototype = new MetaInfo(null, null, null, null, null, null, true);
 
 exports.SignedInfo = SignedInfo;
 
-},{"./buffer.js":139,"./encoding/binary-xml-decoder.js":142,"./encoding/binary-xml-encoder.js":143,"./key-locator.js":163,"./log.js":165,"./name.js":167,"./publisher-public-key-digest.js":169,"./security/key-manager.js":170,"./util/blob.js":173,"./util/ndn-protoco-id-tags.js":176,"./util/ndn-time.js":177}],167:[function(require,module,exports){
+},{"./buffer.js":112,"./encoding/binary-xml-decoder.js":115,"./encoding/binary-xml-encoder.js":116,"./key-locator.js":136,"./log.js":138,"./name.js":140,"./publisher-public-key-digest.js":142,"./security/key-manager.js":143,"./util/blob.js":146,"./util/ndn-protoco-id-tags.js":149,"./util/ndn-time.js":150}],140:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui, Jeff Thompson <jefft0@remap.ucla.edu>
@@ -22990,6 +22407,8 @@ Name.Component = function NameComponent(value)
     // Assume value is a byte array.  We can't check instanceof Array because
     //   this doesn't work in JavaScript if the array comes from a different module.
     this.value = new customBuf(value);
+  else if (!value)
+    this.value = new customBuf(0);
   else 
     throw new Error("Name.Component constructor: Invalid type");
 }
@@ -23491,7 +22910,7 @@ Name.prototype.match = function(name)
   return true;
 };
 
-},{"./buffer.js":139,"./encoding/binary-xml-decoder.js":142,"./encoding/binary-xml-encoder.js":143,"./encoding/data-utils.js":146,"./log.js":165,"./util/blob.js":173,"./util/ndn-protoco-id-tags.js":176}],168:[function(require,module,exports){
+},{"./buffer.js":112,"./encoding/binary-xml-decoder.js":115,"./encoding/binary-xml-encoder.js":116,"./encoding/data-utils.js":119,"./log.js":138,"./util/blob.js":146,"./util/ndn-protoco-id-tags.js":149}],141:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -23593,7 +23012,7 @@ PublisherID.prototype.validate = function()
   return null != id() && null != type();
 };
 
-},{"./encoding/decoding-exception.js":147,"./util/ndn-protoco-id-tags.js":176}],169:[function(require,module,exports){
+},{"./encoding/decoding-exception.js":120,"./util/ndn-protoco-id-tags.js":149}],142:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -23651,7 +23070,7 @@ PublisherPublicKeyDigest.prototype.validate = function()
     return null != this.publisherPublicKeyDigest;
 };
 
-},{"./log.js":165,"./util/ndn-protoco-id-tags.js":176}],170:[function(require,module,exports){
+},{"./log.js":138,"./util/ndn-protoco-id-tags.js":149}],143:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -23723,7 +23142,7 @@ KeyManager.prototype.getKey = function()
 var globalKeyManager = globalKeyManager || new KeyManager();
 exports.globalKeyManager = globalKeyManager;
 
-},{"../key.js":164}],171:[function(require,module,exports){
+},{"../key.js":137}],144:[function(require,module,exports){
 /**
  * Copyright (C) 2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -23868,108 +23287,156 @@ Signature.prototype.validate = function()
   return null != this.signature;
 };
 
-},{"./buffer.js":139,"./encoding/binary-xml-decoder.js":142,"./encoding/binary-xml-encoder.js":143,"./key-locator.js":163,"./log.js":165,"./util/blob.js":173,"./util/ndn-protoco-id-tags.js":176}],172:[function(require,module,exports){
+},{"./buffer.js":112,"./encoding/binary-xml-decoder.js":115,"./encoding/binary-xml-encoder.js":116,"./key-locator.js":136,"./log.js":138,"./util/blob.js":146,"./util/ndn-protoco-id-tags.js":149}],145:[function(require,module,exports){
 /** 
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Wentao Shang
  * See COPYING for copyright and distribution information.
  */
 
-var DataUtils = require('../encoding/data-utils.js').DataUtils;
+var customBuf = require('../buffer.js').Buffer
 var ElementReader = require('../encoding/element-reader.js').ElementReader;
+var DataUtils = require('../encoding/data-utils.js').DataUtils;
 var LOG = require('../log.js').Log.LOG;
 
-var TcpTransport = function TcpTransport() 
-{    
-  this.socket = null;
-  this.sock_ready = false;
-  this.elementReader = null;
-  this.connectedHost = null; // Read by Face.
-  this.connectedPort = null; // Read by Face.
 
-  this.defaultGetHostAndPort = require('../face.js').Face.makeShuffledGetHostAndPort
-    (["A.hub.ndn.ucla.edu", "B.hub.ndn.ucla.edu", "C.hub.ndn.ucla.edu", "D.hub.ndn.ucla.edu", 
-      "E.hub.ndn.ucla.edu", "F.hub.ndn.ucla.edu", "G.hub.ndn.ucla.edu", "H.hub.ndn.ucla.edu", 
-      "I.hub.ndn.ucla.edu", "J.hub.ndn.ucla.edu", "K.hub.ndn.ucla.edu"],
-     6363);
+function makeShuffledGetHostAndPort (hostList, port)
+{
+  // Make a copy.
+  hostList = hostList.slice(0, hostList.length);
+  DataUtils.shuffle(hostList);
+
+  return function() {
+    if (hostList.length == 0)
+      return null;
+
+    return { host: hostList.splice(0, 1)[0], port: port };
+  };
 };
 
-exports.TcpTransport = TcpTransport;
 
-TcpTransport.prototype.connect = function(face, onopenCallback) 
-{
-  if (this.socket != null)
-    delete this.socket;
-
-  this.elementReader = new ElementReader(face);
-
-  // Connect to local ndnd via TCP
-  var net = require('net');
-  this.socket = new net.Socket();
+/**
+ * @constructor
+ */
+var WebSocketTransport = function WebSocketTransport() 
+{    
+  if (!WebSocket)
+    throw new Error("WebSocket support is not available on this platform.");
     
-  var self = this;
+  this.ws = null;
+  this.connectedHost = null; // Read by Face.
+  this.connectedPort = null; // Read by Face.
+  this.elementReader = null;
+  this.defaultGetHostAndPort = makeShuffledGetHostAndPort
+    (["A.ws.ndn.ucla.edu", "B.ws.ndn.ucla.edu", "C.ws.ndn.ucla.edu", "D.ws.ndn.ucla.edu", 
+      "E.ws.ndn.ucla.edu", "F.ws.ndn.ucla.edu", "G.ws.ndn.ucla.edu", "H.ws.ndn.ucla.edu", 
+      "I.ws.ndn.ucla.edu", "J.ws.ndn.ucla.edu", "K.ws.ndn.ucla.edu", "L.ws.ndn.ucla.edu", 
+      "M.ws.ndn.ucla.edu", "N.ws.ndn.ucla.edu"],
+     9696);
+};
 
-  this.socket.on('data', function(data) {      
-    if (typeof data == 'object') {
-      // Make a copy of data (maybe a customBuf or a String)
-      var buf = new customBuf(data);
+exports.WebSocketTransport = WebSocketTransport;
+
+/**
+ * Connect to the host and port in face.  This replaces a previous connection and sets connectedHost
+ *   and connectedPort.  Once connected, call onopenCallback().
+ * Listen on the port to read an entire binary XML encoded element and call
+ *    face.onReceivedElement(element).
+ */
+WebSocketTransport.prototype.connect = function(face, onopenCallback) 
+{
+  this.close();
+  
+  this.ws = new WebSocket('ws:' + face.host + ':' + face.port);
+  if (LOG > 0) console.log('ws connection created.');
+    this.connectedHost = face.host;
+    this.connectedPort = face.port;
+  
+  this.ws.binaryType = "arraybuffer";
+  
+  this.elementReader = new ElementReader(face);
+  var self = this;
+  this.ws.onmessage = function(ev) {
+    var result = ev.data;
+    //console.log('RecvHandle called.');
+      
+    if (result == null || result == undefined || result == "") {
+      console.log('INVALID ANSWER');
+    } 
+    else if (result instanceof ArrayBuffer) {
+      var bytearray = new customBuf(result);
+          
+      if (LOG > 3) console.log('BINARY RESPONSE IS ' + bytearray.toString('hex'));
+      
       try {
         // Find the end of the binary XML element and call face.onReceivedElement.
-        self.elementReader.onReceivedData(buf);
+        self.elementReader.onReceivedData(bytearray);
       } catch (ex) {
-        console.log("NDN.TcpTransport.ondata exception: " + ex);
+        console.log("NDN.ws.onmessage exception: " + ex);
         return;
       }
     }
-  });
-    
-  this.socket.on('connect', function() {
-    if (LOG > 3) console.log('socket.onopen: TCP connection opened.');
-      
-    self.sock_ready = true;
+  }
+  
+  this.ws.onopen = function(ev) {
+    if (LOG > 3) console.log(ev);
+    if (LOG > 3) console.log('ws.onopen: WebSocket connection opened.');
+    if (LOG > 3) console.log('ws.onopen: ReadyState: ' + this.readyState);
+    // Face.registerPrefix will fetch the ndndid when needed.
 
     onopenCallback();
-  });
+  }
+  
+  this.ws.onerror = function(ev) {
+    console.log('ws.onerror: ReadyState: ' + this.readyState);
+    console.log(ev);
+    console.log('ws.onerror: WebSocket error: ' + ev.data);
+  }
+  
+  this.ws.onclose = function(ev) {
+    console.log('ws.onclose: WebSocket connection closed.');
+    self.ws = null;
     
-  this.socket.on('error', function() {
-    if (LOG > 3) console.log('socket.onerror: TCP socket error');
-  });
-    
-  this.socket.on('close', function() {
-    if (LOG > 3) console.log('socket.onclose: TCP connection closed.');
-
-    self.socket = null;
-      
-    // Close Face when TCP Socket is closed
-    face.closeByTransport();
-  });
-
-  this.socket.connect({host: face.host, port: face.port});
-  this.connectedHost = face.host;
-  this.connectedPort = face.port;
+    // Close Face when WebSocket is closed
+    face.readyStatus = 2; //Face.CLOSED
+    face.onclose();
+    //console.log("NDN.onclose event fired.");
+  }
 };
 
 /**
- * Send data.
+ * Send the Uint8Array data.
  */
-TcpTransport.prototype.send = function(/*Buffer*/ data) 
+WebSocketTransport.prototype.send = function(data) 
 {
-  if (this.sock_ready)
-    this.socket.write(data);
+  if (this.ws != null) {
+    // If we directly use data.buffer to feed ws.send(), 
+    // WebSocket may end up sending a packet with 10000 bytes of data.
+    // That is, WebSocket will flush the entire buffer
+    // regardless of the offset of the Uint8Array. So we have to create
+    // a new Uint8Array buffer with just the right size and copy the 
+    // content from binaryInterest to the new buffer.
+    //    ---Wentao
+    var bytearray = new Uint8Array(data.length);
+    bytearray.set(data);
+    this.ws.send(bytearray.buffer);
+    if (LOG > 3) console.log('ws.send() returned.');
+  }
   else
-    console.log('TCP connection is not established.');
+    console.log('WebSocket connection is not established.');
 };
 
 /**
- * Close transport
+ * Close the connection.
  */
-TcpTransport.prototype.close = function() 
+WebSocketTransport.prototype.close = function()
 {
-  this.socket.end();
-  if (LOG > 3) console.log('TCP connection closed.');
-};
+  if (this.ws != null)
+    delete this.ws;
+}
 
-},{"../encoding/data-utils.js":146,"../encoding/element-reader.js":148,"../face.js":159,"../log.js":165,"net":3}],173:[function(require,module,exports){
+
+},{"../buffer.js":112,"../encoding/data-utils.js":119,"../encoding/element-reader.js":121,"../log.js":138}],146:[function(require,module,exports){
 /**
  * Copyright (C) 2013 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -24067,7 +23534,7 @@ Blob.prototype.toHex = function()
     return this.buffer.toString('hex');
 };
 
-},{"../buffer.js":139}],174:[function(require,module,exports){
+},{"../buffer.js":112}],147:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -24181,7 +23648,7 @@ DynamicBuffer.prototype.slice = function(begin, end)
   return this.array.slice(begin, end);
 };
 
-},{"../buffer.js":139}],175:[function(require,module,exports){
+},{"../buffer.js":112}],148:[function(require,module,exports){
 (function (Buffer){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
@@ -24324,7 +23791,7 @@ NameEnumeration.endsWithSegmentNumber = function(name) {
 };
 
 }).call(this,require("buffer").Buffer)
-},{"../buffer.js":139,"../encoding/binary-xml-decoder.js":142,"../encoding/data-utils.js":146,"../name.js":167,"./ndn-protoco-id-tags.js":176,"buffer":5}],176:[function(require,module,exports){
+},{"../buffer.js":112,"../encoding/binary-xml-decoder.js":115,"../encoding/data-utils.js":119,"../name.js":140,"./ndn-protoco-id-tags.js":149,"buffer":2}],149:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -24482,7 +23949,7 @@ var NDNProtocolDTagsStrings = [
 
 exports.NDNProtocolDTagsStrings = NDNProtocolDTagsStrings;
 
-},{}],177:[function(require,module,exports){
+},{}],150:[function(require,module,exports){
 /**
  * Copyright (C) 2013-2014 Regents of the University of California.
  * @author: Meki Cheraoui
@@ -24515,7 +23982,7 @@ NDNTime.prototype.getJavascriptDate = function()
   return d
 };  
 
-},{"../log.js":165}],178:[function(require,module,exports){
+},{"../log.js":138}],151:[function(require,module,exports){
 /**
  * Copyright (C) 2013 Regents of the University of California.
  * @author: Jeff Thompson <jefft0@remap.ucla.edu>
@@ -24612,9 +24079,9 @@ SignedBlob.prototype.getSignedPortionEndOffset = function()
   return this.signedPortionEndOffset;
 };
 
-},{"../buffer.js":139,"./blob.js":173}],179:[function(require,module,exports){
+},{"../buffer.js":112,"./blob.js":146}],152:[function(require,module,exports){
 (function(){
-    
+
     // Copyright (c) 2005  Tom Wu
     // All Rights Reserved.
     // See "LICENSE" for details.
@@ -25824,6 +25291,9 @@ SignedBlob.prototype.getSignedPortionEndOffset = function()
     // JSBN-specific extension
     BigInteger.prototype.square = bnSquare;
 
+    // Expose the Barrett function
+    BigInteger.prototype.Barrett = Barrett
+
     // BigInteger interfaces not implemented in jsbn:
 
     // BigInteger(int signum, byte[] magnitude)
@@ -25837,6 +25307,338 @@ SignedBlob.prototype.getSignedPortionEndOffset = function()
     } else {
         this.BigInteger = BigInteger;
     }
-    
+
 }).call(this);
-},{}]},{},[2]);
+
+},{}],153:[function(require,module,exports){
+module.exports=require(101)
+},{"jsbn":204}],154:[function(require,module,exports){
+module.exports=require(102)
+},{}],155:[function(require,module,exports){
+module.exports=require(103)
+},{}],156:[function(require,module,exports){
+arguments[4][104][0].apply(exports,arguments)
+},{"./sha256.js":161,"jsbn":204}],157:[function(require,module,exports){
+module.exports=require(105)
+},{"jsbn":204}],158:[function(require,module,exports){
+arguments[4][106][0].apply(exports,arguments)
+},{"./rsa.js":157,"jsbn":204}],159:[function(require,module,exports){
+arguments[4][107][0].apply(exports,arguments)
+},{"./asn1hex-1.1.js":153,"./base64.js":154,"./rsa2.js":158}],160:[function(require,module,exports){
+arguments[4][108][0].apply(exports,arguments)
+},{"./rsapem-1.1.js":159,"jsbn":204}],161:[function(require,module,exports){
+module.exports=require(109)
+},{"./core.js":155}],162:[function(require,module,exports){
+arguments[4][110][0].apply(exports,arguments)
+},{"./js/buffer.js":164,"./js/closure.js":165,"./js/data.js":166,"./js/encoding/binary-xml-wire-format.js":170,"./js/encoding/data-utils.js":171,"./js/encoding/element-reader.js":173,"./js/encoding/encoding-utils.js":174,"./js/encoding/tlv-wire-format.js":176,"./js/encoding/tlv/tlv-decoder.js":177,"./js/encoding/tlv/tlv.js":180,"./js/encoding/wire-format.js":181,"./js/exclude.js":182,"./js/face.js":184,"./js/forwarding-flags.js":186,"./js/interest.js":187,"./js/key-locator.js":188,"./js/key.js":189,"./js/meta-info.js":191,"./js/name.js":192,"./js/publisher-public-key-digest.js":194,"./js/security/key-manager.js":195,"./js/util/blob.js":198,"./js/util/name-enumeration.js":200,"./js/util/ndn-time.js":202}],163:[function(require,module,exports){
+arguments[4][111][0].apply(exports,arguments)
+},{"./transport/web-socket-transport.js":197}],164:[function(require,module,exports){
+arguments[4][112][0].apply(exports,arguments)
+},{"../contrib/securityLib/asn1hex-1.1.js":153,"../contrib/securityLib/base64.js":154,"../contrib/securityLib/crypto-1.0.js":156,"../contrib/securityLib/rsasign-1.2.js":160}],165:[function(require,module,exports){
+module.exports=require(113)
+},{}],166:[function(require,module,exports){
+arguments[4][114][0].apply(exports,arguments)
+},{"./buffer.js":164,"./crypto.js":164,"./encoding/binary-xml-encoder.js":168,"./encoding/binary-xml-wire-format.js":170,"./encoding/data-utils.js":171,"./encoding/wire-format.js":181,"./key-locator.js":188,"./meta-info.js":191,"./name.js":192,"./security/key-manager.js":195,"./signature.js":196,"./util/blob.js":198,"./util/ndn-protoco-id-tags.js":201,"./util/signed-blob.js":203,"buffer":2,"crypto":6}],167:[function(require,module,exports){
+arguments[4][115][0].apply(exports,arguments)
+},{"../buffer.js":164,"../log.js":190,"../util/ndn-protoco-id-tags.js":201,"../util/ndn-time.js":202,"./data-utils.js":171,"./decoding-exception.js":172}],168:[function(require,module,exports){
+arguments[4][116][0].apply(exports,arguments)
+},{"../buffer.js":164,"../log.js":190,"../util/dynamic-buffer.js":199,"../util/ndn-protoco-id-tags.js":201,"./data-utils.js":171}],169:[function(require,module,exports){
+arguments[4][117][0].apply(exports,arguments)
+},{"../util/dynamic-buffer.js":199,"./binary-xml-decoder.js":167}],170:[function(require,module,exports){
+arguments[4][118][0].apply(exports,arguments)
+},{"../exclude.js":182,"../key-locator.js":188,"../meta-info.js":191,"../name.js":192,"../publisher-public-key-digest.js":194,"../signature.js":196,"../util/blob.js":198,"../util/ndn-protoco-id-tags.js":201,"./binary-xml-decoder.js":167,"./binary-xml-encoder.js":168,"./data-utils.js":171,"./wire-format.js":181}],171:[function(require,module,exports){
+arguments[4][119][0].apply(exports,arguments)
+},{"../buffer.js":164}],172:[function(require,module,exports){
+module.exports=require(120)
+},{}],173:[function(require,module,exports){
+arguments[4][121][0].apply(exports,arguments)
+},{"../buffer.js":164,"../log.js":190,"./binary-xml-structure-decoder.js":169,"./data-utils.js":171,"./tlv/tlv-structure-decoder.js":179,"./tlv/tlv.js":180}],174:[function(require,module,exports){
+arguments[4][122][0].apply(exports,arguments)
+},{"../data.js":166,"../face-instance.js":183,"../forwarding-entry.js":185,"../interest.js":187,"../key-locator.js":188,"../key.js":189,"../log.js":190,"./binary-xml-decoder.js":167,"./binary-xml-encoder.js":168,"./data-utils.js":171,"./wire-format.js":181}],175:[function(require,module,exports){
+arguments[4][123][0].apply(exports,arguments)
+},{"../crypto.js":164,"../exclude.js":182,"../key-locator.js":188,"../meta-info.js":191,"../signature.js":196,"../util/blob.js":198,"./decoding-exception.js":172,"./tlv/tlv-decoder.js":177,"./tlv/tlv-encoder.js":178,"./tlv/tlv.js":180,"./wire-format.js":181,"crypto":6}],176:[function(require,module,exports){
+arguments[4][124][0].apply(exports,arguments)
+},{"./tlv-0_1a2-wire-format.js":175,"./wire-format.js":181}],177:[function(require,module,exports){
+arguments[4][125][0].apply(exports,arguments)
+},{"../../buffer.js":164,"../decoding-exception.js":172}],178:[function(require,module,exports){
+arguments[4][126][0].apply(exports,arguments)
+},{"../../buffer.js":164,"../../util/dynamic-buffer.js":199}],179:[function(require,module,exports){
+arguments[4][127][0].apply(exports,arguments)
+},{"../../buffer.js":164,"./tlv-decoder.js":177}],180:[function(require,module,exports){
+module.exports=require(128)
+},{}],181:[function(require,module,exports){
+arguments[4][129][0].apply(exports,arguments)
+},{"../buffer.js":164,"./tlv-wire-format.js":176}],182:[function(require,module,exports){
+arguments[4][130][0].apply(exports,arguments)
+},{"./buffer.js":164,"./encoding/binary-xml-decoder.js":167,"./encoding/binary-xml-encoder.js":168,"./encoding/data-utils.js":171,"./name.js":192,"./util/ndn-protoco-id-tags.js":201}],183:[function(require,module,exports){
+arguments[4][131][0].apply(exports,arguments)
+},{"./publisher-public-key-digest.js":194,"./util/ndn-protoco-id-tags.js":201}],184:[function(require,module,exports){
+arguments[4][132][0].apply(exports,arguments)
+},{"./buffer.js":164,"./closure.js":165,"./crypto.js":164,"./data.js":166,"./encoding/binary-xml-decoder.js":167,"./encoding/binary-xml-encoder.js":168,"./encoding/binary-xml-wire-format.js":170,"./encoding/data-utils.js":171,"./encoding/tlv-wire-format.js":176,"./encoding/tlv/tlv-decoder.js":177,"./encoding/tlv/tlv.js":180,"./forwarding-entry.js":185,"./forwarding-flags.js":186,"./interest.js":187,"./key-locator.js":188,"./key.js":189,"./log.js":190,"./meta-info.js":191,"./name.js":192,"./security/key-manager.js":195,"./transport/tcp-transport.js":163,"./util/ndn-protoco-id-tags.js":201}],185:[function(require,module,exports){
+arguments[4][133][0].apply(exports,arguments)
+},{"./name.js":192,"./publisher-public-key-digest.js":194,"./util/ndn-protoco-id-tags.js":201}],186:[function(require,module,exports){
+arguments[4][134][0].apply(exports,arguments)
+},{"./forwarding-entry.js":185}],187:[function(require,module,exports){
+arguments[4][135][0].apply(exports,arguments)
+},{"./buffer.js":164,"./encoding/binary-xml-wire-format.js":170,"./encoding/wire-format.js":181,"./exclude.js":182,"./key-locator.js":188,"./log.js":190,"./name.js":192,"./publisher-public-key-digest.js":194,"./util/blob.js":198}],188:[function(require,module,exports){
+arguments[4][136][0].apply(exports,arguments)
+},{"./buffer.js":164,"./log.js":190,"./name.js":192,"./publisher-id.js":193,"./util/ndn-protoco-id-tags.js":201}],189:[function(require,module,exports){
+arguments[4][137][0].apply(exports,arguments)
+},{"./buffer.js":164,"./crypto.js":164,"./encoding/data-utils.js":171,"./log.js":190}],190:[function(require,module,exports){
+module.exports=require(138)
+},{}],191:[function(require,module,exports){
+arguments[4][139][0].apply(exports,arguments)
+},{"./buffer.js":164,"./encoding/binary-xml-decoder.js":167,"./encoding/binary-xml-encoder.js":168,"./key-locator.js":188,"./log.js":190,"./name.js":192,"./publisher-public-key-digest.js":194,"./security/key-manager.js":195,"./util/blob.js":198,"./util/ndn-protoco-id-tags.js":201,"./util/ndn-time.js":202}],192:[function(require,module,exports){
+arguments[4][140][0].apply(exports,arguments)
+},{"./buffer.js":164,"./encoding/binary-xml-decoder.js":167,"./encoding/binary-xml-encoder.js":168,"./encoding/data-utils.js":171,"./log.js":190,"./util/blob.js":198,"./util/ndn-protoco-id-tags.js":201}],193:[function(require,module,exports){
+module.exports=require(141)
+},{"./encoding/decoding-exception.js":172,"./util/ndn-protoco-id-tags.js":201}],194:[function(require,module,exports){
+module.exports=require(142)
+},{"./log.js":190,"./util/ndn-protoco-id-tags.js":201}],195:[function(require,module,exports){
+arguments[4][143][0].apply(exports,arguments)
+},{"../key.js":189}],196:[function(require,module,exports){
+arguments[4][144][0].apply(exports,arguments)
+},{"./buffer.js":164,"./encoding/binary-xml-decoder.js":167,"./encoding/binary-xml-encoder.js":168,"./key-locator.js":188,"./log.js":190,"./util/blob.js":198,"./util/ndn-protoco-id-tags.js":201}],197:[function(require,module,exports){
+arguments[4][145][0].apply(exports,arguments)
+},{"../buffer.js":164,"../encoding/data-utils.js":171,"../encoding/element-reader.js":173,"../log.js":190}],198:[function(require,module,exports){
+arguments[4][146][0].apply(exports,arguments)
+},{"../buffer.js":164}],199:[function(require,module,exports){
+arguments[4][147][0].apply(exports,arguments)
+},{"../buffer.js":164}],200:[function(require,module,exports){
+arguments[4][148][0].apply(exports,arguments)
+},{"../buffer.js":164,"../encoding/binary-xml-decoder.js":167,"../encoding/data-utils.js":171,"../name.js":192,"./ndn-protoco-id-tags.js":201,"buffer":2}],201:[function(require,module,exports){
+module.exports=require(149)
+},{}],202:[function(require,module,exports){
+module.exports=require(150)
+},{"../log.js":190}],203:[function(require,module,exports){
+arguments[4][151][0].apply(exports,arguments)
+},{"../buffer.js":164,"./blob.js":198}],204:[function(require,module,exports){
+module.exports=require(152)
+},{}],205:[function(require,module,exports){
+var utils = {}
+  , ndn = require('ndn-lib')
+var Data = ndn.Data
+var Name = ndn.Name
+var SignedInfo = ndn.SignedInfo
+var ndnbuf = ndn.customBuffer
+var DataUtils = ndn.DataUtils
+
+utils.chunkArbitraryData = function(opts) {
+  var ndnArray = [];
+  //console.log(name)
+  if (opts.type == 'object') {
+    var string = JSON.stringify(opts.thing);
+  }
+  var name = new ndn.Name(opts.uri)
+  if (opts.version != false) {
+    utils.appendVersion(name, opts.version)
+  }
+  var stringArray = string.match(/.{1,1300}/g);
+  var segmentNames = [];
+  for (i = 0; i < stringArray.length; i++) {
+    segmentNames[i] = new Name(name).appendSegment(i)
+    var co = new Data(segmentNames[i], new SignedInfo(), stringArray[i]);
+    co.signedInfo.setFields()
+    co.signedInfo.finalBlockID = utils.initSegment(stringArray.length - 1)
+
+    if (opts.freshness != undefined) {
+      co.signedInfo.setFreshnessPeriod(opts.freshness)
+    }
+    co.sign()
+    ndnArray[i] = co.wireEncode()
+  };
+
+  return {array:ndnArray, name: name};
+
+};
+
+utils.initSegment = function(seg) {
+    if (seg == null || seg == 0)
+	  return (new ndnbuf('00', 'hex'));
+
+    var segStr = seg.toString(16);
+
+    if (segStr.length % 2 == 1)
+	segStr = '0' + segStr;
+
+    segStr = '00' + segStr;
+    return (new ndnbuf(segStr, 'hex'));
+};
+
+utils.getAllPrefixes = function(name) {
+  var uriArray = [];
+  for (i = 0 ; i < name.components.length + 1 ; i++) {
+    var uri = name.getPrefix(i).toUri()
+    uriArray.push(uri);
+  };
+  return uriArray;
+};
+
+utils.isFirstSegment = function(name) {
+    return name.components != null && name.components.length >= 1 &&
+        name.components[name.components.length - 1].value.length == 1 &&
+        name.components[name.components.length - 1].value[0] == 0;
+};
+
+utils.isLastSegment = function(name, co) {
+
+    return DataUtils.arraysEqual(name.components[name.components.length - 1].value, co.signedInfo.finalBlockID);
+}
+
+utils.normalizeUri = function(name) {
+  //console.log(name)
+  if (!endsWithSegmentNumber(name)) {
+    normalizedName = name;
+    requestedSegment = 0
+  } else if (!isFirstSegment(name)) {
+    normalizedName = name.getPrefix(name.components.length - 1);
+    requestedSegment = DataUtils.bigEndianToUnsignedInt(name.components[name.components.length - 1].value);
+  } else {
+    normalizedName = name.getPrefix(name.components.length - 1) ;
+    requestedSegment = 0;
+  };
+  var returns = [normalizedName, requestedSegment];
+  return returns;
+};
+
+utils.getSegmentInteger = function(name) {
+  if (name.components != null && name.components.length >= 1 &&
+  name.components[name.components.length - 1].value.length >= 1 &&
+  name.components[name.components.length - 1].value[0] == 0) {
+    return DataUtils.bigEndianToUnsignedInt(name.components[name.components.length - 1].value)
+  } else {
+    return 0;
+  }
+};
+
+utils.normalizeNameToObjectStore = function(name) {
+  var throwaway = utils.getNameWithoutCommandMarker(name);
+
+  if (!utils.endsWithSegmentNumber(throwaway)) {
+    return throwaway.appendSegment(0).toUri();
+  } else if (!utils.isFirstSegment(throwaway)) {
+    return throwaway.getPrefix(name.components.length - 1).appendSegment(0).toUri();
+  } else {
+    return throwaway.toUri();
+  };
+};
+
+utils.endsWithSegmentNumber = function(name) {
+    return name.components != null && name.components.length >= 1 &&
+        name.components[name.components.length - 1].value.length >= 1 &&
+        name.components[name.components.length - 1].value[0] == 0;
+}
+
+utils.nameHasCommandMarker = function(name) {
+  for (var i = name.size() - 1; i >= 0; --i) {
+    var component = name.components[i].getValue();
+    if (component.length <= 0)
+      continue;
+
+    if (component[0] == 0xC1) {
+      return true
+    };
+  }
+
+  return false;
+};
+
+utils.getCommandMarker = function(name) {
+  //console.log(name)
+  for (var i = name.size() - 1; i >= 0; --i) {
+    var component = name.components[i].getValue();
+    if (component.length <= 0)
+      continue;
+
+    if (component[0] == 0xC1 && component[2] != 0x4E) {
+      return name.components[i].toEscapedString()
+    };
+  }
+};
+
+utils.getNameWithoutCommandMarker = function(name) {
+  var strippedName = new Name('');
+
+  for (var i = 0 ; i < name.size(); i++) {
+    var component = name.components[i].getValue();
+    if (component.length <= 0)
+      continue;
+
+    if (component[0] != 0xC1) {
+      strippedName.append(name.components[i]);
+    };
+  };
+  return strippedName;
+};
+
+
+utils.getSuffix = function(name, p) {
+    return new Name().append(new Name.Component(name.components.slice(p)));
+};
+
+utils.appendVersion = function(name, date) {
+    console.log(date)
+    if (date) {
+      if (date instanceof Date) {
+        var d = date.getTime()
+
+      } else if (typeof date == "number")
+        var d = new Date().setTime(date)
+      else
+        var d = new Date().getTime()
+    } else {
+      var d = new Date().getTime();
+    };
+
+    var time = d.toString(16);
+    if (time.length % 2 == 1) {
+	    time = '0' + time;
+    };
+    time = 'fd' + time;
+    var binTime = new ndnbuf(time, 'hex');
+    //console.log(binTime)
+    return name.append(binTime);
+};
+
+utils.timeToVersion = function(date) {
+  if (date instanceof Date) {
+    var d = date.getTime
+  } else {
+    var d = date;
+  };
+  var time = d.toString(16);
+  if (time.length % 2 == 1) {
+    time = '0' + time;
+  };
+  time = 'fd' + time;
+  var binTime = new ndnbuf(time, 'hex');
+  return (new Name.Component(binTime).toEscapedString())
+
+};
+
+utils.versionToTime = function(version) {
+  time = 0
+  array = DataUtils.toNumbers(DataUtils.toHex(version))
+  //console.log(array)
+  for (i = 1; i < array.length ; i++) {
+    time = time + (array[i] * Math.pow(2, (7 - i)));
+    //console.log(time)
+  };
+  return time
+};
+
+
+
+utils.setNonce = function(interest) {
+  var bytes = [0xc1, 0x2e, 0x4e, 0x00];
+  for (var n = 8; n > 0; n--) {
+	  bytes.push(Math.floor(Math.random() * 256));
+	  //console.log(bytes)
+  }
+  var buf = new ndnbuf(bytes);
+  interest.nonce = buf;
+}
+
+module.exports = utils;
+
+},{"ndn-lib":162}]},{},[25])
